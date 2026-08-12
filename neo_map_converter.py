@@ -485,21 +485,10 @@ def export_hammer(neo: NeoFile, destination: Path, scale: float, flip_v: bool) -
     texinfos = neo.texinfo()
     meshes = {record[2]: record for record in neo.meshes()}
     textures = {item.index: item for item in neo.texture_info()}
-    additive_textures: set[int] = set()
-    translucent_textures: set[int] = set()
     resolved_by_draw: dict[int, tuple[TexInfo | None, int | None, int | None, str | None]] = {}
     for draw_id, record in meshes.items():
         resolved = resolve_mesh_material(neo, record, texinfos)
         resolved_by_draw[draw_id] = resolved
-        _, texture_index, shader_id, shader_name = resolved
-        lowered_shader = (shader_name or "").lower()
-        direct_material = texinfos[record[3]].texture_index >= 0
-        if direct_material and texture_index is not None and (
-            "additive" in lowered_shader or shader_id == 15
-        ):
-            additive_textures.add(texture_index)
-        if direct_material and texture_index is not None and "translucent" in lowered_shader:
-            translucent_textures.add(texture_index)
     used_diffuse_textures = {
         resolved[1] for resolved in resolved_by_draw.values() if resolved[1] is not None
     }
@@ -639,17 +628,10 @@ def export_hammer(neo: NeoFile, destination: Path, scale: float, flip_v: bool) -
             continue
         material = f"neo_{index:04d}_{texture.name}"
         vmt = materials / f"{material}.vmt"
-        translucent = index in translucent_textures or any(
-            marker in texture.name.lower() for marker in ("alpha", "trans", "glass")
-        )
-        additive = index in additive_textures
-        source_shader = "UnlitGeneric" if additive else "VertexLitGeneric"
         vmt.write_text(
-            f'"{source_shader}"\n{{\n'
+            '"VertexLitGeneric"\n{\n'
             f'    "$basetexture" "{material_rel}/{material}"\n'
-            + ('    "$translucent" "1"\n' if translucent or additive else '')
-            + ('    "$additive" "1"\n' if additive else '')
-            + '}\n', encoding="utf-8"
+            '}\n', encoding="utf-8"
         )
         source = extracted.get(index)
         if source and source.is_file():
@@ -872,10 +854,16 @@ def compile_hammer_output(
         elif image.suffix.lower() == ".tga" and len(header) >= 18:
             width, height = struct.unpack_from("<HH", header, 12)
         scale_filter = None
-        if width > max_vtf_size or height > max_vtf_size:
-            factor = min(max_vtf_size / width, max_vtf_size / height)
-            target_width = max(1, round(width * factor))
-            target_height = max(1, round(height * factor))
+        if width and height:
+            # Source 1's vtex requires power-of-two dimensions and can crash
+            # outright for images such as 176x176 or 768x768. Reduce each
+            # dimension independently to the largest permitted power of two.
+            size_limit = max(1, max_vtf_size)
+            target_width = 1 << (min(width, size_limit).bit_length() - 1)
+            target_height = 1 << (min(height, size_limit).bit_length() - 1)
+        else:
+            target_width, target_height = width, height
+        if target_width != width or target_height != height:
             scale_filter = f"scale={target_width}:{target_height}"
             log(f"  resizing {width}x{height} to {target_width}x{target_height}")
 
