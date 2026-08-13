@@ -13,8 +13,10 @@ Neo_LoadNeoModel, loadFileStructure, and the individual lump loaders.
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import math
+import re
 import shutil
 import struct
 import subprocess
@@ -739,6 +741,516 @@ def export_hammer(neo: NeoFile, destination: Path, scale: float, flip_v: bool) -
     }
 
 
+MAP_FACE_RE = re.compile(
+    r"^\s*\(\s*([^)]*?)\s*\)\s*\(\s*([^)]*?)\s*\)\s*"
+    r"\(\s*([^)]*?)\s*\)\s+(\S+)"
+)
+
+
+def _vsub(a: tuple[float, float, float], b: tuple[float, float, float]) -> tuple[float, float, float]:
+    return tuple(a[i] - b[i] for i in range(3))
+
+
+def _dot(a: tuple[float, float, float], b: tuple[float, float, float]) -> float:
+    return sum(a[i] * b[i] for i in range(3))
+
+
+def _cross(a: tuple[float, float, float], b: tuple[float, float, float]) -> tuple[float, float, float]:
+    return (a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0])
+
+
+def _plane(points: Sequence[tuple[float, float, float]]) -> tuple[tuple[float, float, float], float] | None:
+    normal = _cross(_vsub(points[1], points[0]), _vsub(points[2], points[0]))
+    length = math.sqrt(_dot(normal, normal))
+    if length < 1e-8:
+        return None
+    normal = tuple(value / length for value in normal)
+    return normal, _dot(normal, points[0])
+
+
+def _intersection(a, b, c) -> tuple[float, float, float] | None:
+    na, da = a
+    nb, db = b
+    nc, dc = c
+    denominator = _dot(na, _cross(nb, nc))
+    if abs(denominator) < 1e-9:
+        return None
+    bc, ca, ab = _cross(nb, nc), _cross(nc, na), _cross(na, nb)
+    return tuple((da * bc[i] + db * ca[i] + dc * ab[i]) / denominator for i in range(3))
+
+
+def parse_decompiled_world_brushes(path: Path) -> list[list[dict]]:
+    """Parse worldspawn brushes from a Valve 220 GoldSrc MAP file."""
+    brushes: list[list[dict]] = []
+    depth = 0
+    in_world = False
+    current: list[dict] | None = None
+    for line in path.read_text(encoding="latin-1", errors="replace").splitlines():
+        stripped = line.strip()
+        if stripped == "{":
+            depth += 1
+            if depth == 1:
+                in_world = not brushes
+            elif in_world and depth == 2:
+                current = []
+            continue
+        if stripped == "}":
+            if in_world and depth == 2 and current is not None:
+                if current:
+                    brushes.append(current)
+                current = None
+            depth -= 1
+            if depth == 0 and in_world:
+                break
+            continue
+        if not in_world or depth != 2 or current is None:
+            continue
+        match = MAP_FACE_RE.match(line)
+        if not match:
+            continue
+        try:
+            points = [tuple(map(float, match.group(i).split())) for i in range(1, 4)]
+        except ValueError:
+            continue
+        plane = _plane(points)
+        if plane:
+            current.append({"points": points, "texture": match.group(4), "plane": plane})
+    return brushes
+
+
+def reconstruct_brush_faces(brush: list[dict]) -> bool:
+    planes = [face["plane"] for face in brush]
+    for first, second in itertools.combinations(planes, 2):
+        alignment = _dot(first[0], second[0])
+        same_distance = abs(first[1] - second[1]) if alignment > 0 else abs(first[1] + second[1])
+        if abs(alignment) > 0.99999 and same_distance < 0.05:
+            return False
+    vertices: list[tuple[float, float, float]] = []
+    for indices in itertools.combinations(range(len(planes)), 3):
+        point = _intersection(*(planes[index] for index in indices))
+        if (point is None or not all(math.isfinite(value) for value in point)
+                or any(abs(value) > 32768 for value in point)):
+            continue
+        # GoldSrc MAP plane winding points toward the brush interior.
+        if all(_dot(normal, point) >= distance - 0.05 for normal, distance in planes):
+            if not any(sum((point[i] - old[i]) ** 2 for i in range(3)) < 0.01 for old in vertices):
+                vertices.append(point)
+    if len(vertices) < 4:
+        return False
+    for face in brush:
+        normal, distance = face["plane"]
+        polygon = [point for point in vertices if abs(_dot(normal, point) - distance) <= 0.1]
+        if len(polygon) < 3:
+            return False
+        center = tuple(sum(point[i] for point in polygon) / len(polygon) for i in range(3))
+        face["polygon"] = polygon
+        face["center"] = center
+    return True
+
+
+def neo_surface_samples(neo: NeoFile, max_texture_size: int = 1024) -> list[dict]:
+    vertices, texcoords, indices = neo.vertices(), neo.texcoords(), neo.indices()
+    commands, texinfos = neo.draw_commands(), neo.texinfo()
+    meshes = {record[2]: record for record in neo.meshes()}
+    textures = {item.index: item for item in neo.texture_info()}
+    samples: list[dict] = []
+    for draw_id, command in enumerate(commands):
+        mesh = meshes.get(draw_id)
+        if mesh is None:
+            continue
+        info, texture_index, _, _ = resolve_mesh_material(neo, mesh, texinfos)
+        texture = textures.get(texture_index) if texture_index is not None else None
+        if info is None or texture is None:
+            continue
+        if command.indexed:
+            base, runs = indexed_runs(command, indices)
+            streams = [[(base + value, info.uv_start + value) for value in run] for run in runs]
+        else:
+            end = min(command.start + command.count, len(vertices))
+            streams = [[(value, info.uv_start + value - command.start) for value in range(command.start, end)]]
+        for stream in streams:
+            for triangle in triangles_for_primitive(command.mode, stream):
+                vi = [corner[0] for corner in triangle]
+                ui = [corner[1] for corner in triangle]
+                if len(set(vi)) != 3 or any(v < 0 or v >= len(vertices) for v in vi):
+                    continue
+                if any(u < 0 or u >= len(texcoords) for u in ui):
+                    continue
+                points = [vertices[v] for v in vi]
+                plane = _plane(points)
+                if plane is None:
+                    continue
+                width, height = texture.width, texture.height
+                if texture.external_reference:
+                    source = neo.path.parent.parent / "tex" / Path(texture.external_reference)
+                    if source.is_file():
+                        header = source.read_bytes()[:128]
+                        if header[:4] == b"DDS " and len(header) >= 20:
+                            height, width = struct.unpack_from("<II", header, 12)
+                        elif source.suffix.lower() == ".tga" and len(header) >= 18:
+                            width, height = struct.unpack_from("<HH", header, 12)
+                # Brush texture axes use VTF texel dimensions. Match the exact
+                # power-of-two resizing performed before vtex compilation.
+                width = 1 << (min(max(1, width), max_texture_size).bit_length() - 1)
+                height = 1 << (min(max(1, height), max_texture_size).bit_length() - 1)
+                samples.append({
+                    "center": tuple(sum(point[i] for point in points) / 3 for i in range(3)),
+                    "normal": plane[0], "distance": plane[1], "points": points,
+                    "uv": [texcoords[u] for u in ui],
+                    "material": f"neo_{texture.index:04d}_{texture.name}",
+                    "width": max(1, width), "height": max(1, height),
+                })
+    return samples
+
+
+def fitted_texture_axis(sample: dict, values: Sequence[float], center, scale: float) -> str | None:
+    p0, p1, p2 = sample["points"]
+    e1, e2 = _vsub(p1, p0), _vsub(p2, p0)
+    aa, ab, bb = _dot(e1, e1), _dot(e1, e2), _dot(e2, e2)
+    determinant = aa * bb - ab * ab
+    if abs(determinant) < 1e-10:
+        return None
+    d1, d2 = values[1] - values[0], values[2] - values[0]
+    first = (d1 * bb - d2 * ab) / determinant
+    second = (d2 * aa - d1 * ab) / determinant
+    gradient = tuple(first * e1[i] + second * e2[i] for i in range(3))
+    magnitude = math.sqrt(_dot(gradient, gradient))
+    if magnitude < 1e-10:
+        return None
+    # studiomdl/Source rotates native NEO XY as (-Y, X). VMF texture axes
+    # must use the same coordinate system as the transformed brush planes.
+    source_gradient = (-gradient[1], gradient[0], gradient[2])
+    axis = tuple(value / magnitude for value in source_gradient)
+    axis_scale = scale / magnitude
+    offset = values[0] - _dot(gradient, p0) + _dot(gradient, center)
+    return f"[{axis[0]:.9g} {axis[1]:.9g} {axis[2]:.9g} {offset:.9g}] {axis_scale:.9g}"
+
+
+def _projection_axis(normal: tuple[float, float, float]) -> int:
+    return max(range(3), key=lambda axis: abs(normal[axis]))
+
+
+def _project_2d(point: tuple[float, float, float], dropped: int) -> tuple[float, float]:
+    axes = [axis for axis in range(3) if axis != dropped]
+    return point[axes[0]], point[axes[1]]
+
+
+def _polygon_area_2d(polygon: Sequence[tuple[float, float]]) -> float:
+    return abs(sum(
+        polygon[index][0] * polygon[(index + 1) % len(polygon)][1]
+        - polygon[(index + 1) % len(polygon)][0] * polygon[index][1]
+        for index in range(len(polygon))
+    )) * 0.5
+
+
+def _convex_hull_2d(points: Sequence[tuple[float, float]]) -> list[tuple[float, float]]:
+    unique = sorted(set(points))
+    if len(unique) <= 2:
+        return unique
+    def turn(a, b, c):
+        return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+    lower: list[tuple[float, float]] = []
+    for point in unique:
+        while len(lower) >= 2 and turn(lower[-2], lower[-1], point) <= 1e-8:
+            lower.pop()
+        lower.append(point)
+    upper: list[tuple[float, float]] = []
+    for point in reversed(unique):
+        while len(upper) >= 2 and turn(upper[-2], upper[-1], point) <= 1e-8:
+            upper.pop()
+        upper.append(point)
+    return lower[:-1] + upper[:-1]
+
+
+def _convex_intersection_area(subject, clip) -> float:
+    """Sutherland-Hodgman intersection area for counter-clockwise polygons."""
+    output = list(subject)
+    for index, edge_start in enumerate(clip):
+        edge_end = clip[(index + 1) % len(clip)]
+        input_polygon, output = output, []
+        if not input_polygon:
+            break
+        def side(point):
+            return ((edge_end[0] - edge_start[0]) * (point[1] - edge_start[1])
+                    - (edge_end[1] - edge_start[1]) * (point[0] - edge_start[0]))
+        previous = input_polygon[-1]
+        previous_inside = side(previous) >= -1e-7
+        for current in input_polygon:
+            current_inside = side(current) >= -1e-7
+            if current_inside != previous_inside:
+                dx, dy = current[0] - previous[0], current[1] - previous[1]
+                ex, ey = edge_end[0] - edge_start[0], edge_end[1] - edge_start[1]
+                denominator = dx * ey - dy * ex
+                if abs(denominator) > 1e-12:
+                    t = ((edge_start[0] - previous[0]) * ey
+                         - (edge_start[1] - previous[1]) * ex) / denominator
+                    output.append((previous[0] + t * dx, previous[1] + t * dy))
+            if current_inside:
+                output.append(current)
+            previous, previous_inside = current, current_inside
+    return _polygon_area_2d(output) if len(output) >= 3 else 0.0
+
+
+def export_collision_hybrid_vmf(
+    neo: NeoFile, map_path: Path, model_vmf: Path, destination: Path, scale: float
+) -> dict:
+    """Add invisible decompiled world collision to the textured model VMF."""
+    brushes = parse_decompiled_world_brushes(map_path)
+    vertices = neo.vertices()
+    logical = neo.lumps[1].count or len(vertices)
+    position_vertices = vertices[:min(logical, len(vertices))]
+    center = tuple(
+        (min(point[i] for point in position_vertices) + max(point[i] for point in position_vertices)) * 0.5
+        for i in range(3)
+    )
+    solids: list[str] = []
+    invalid = 0
+    solid_id, side_id = 1_000_000, 2_000_000
+    for brush in brushes:
+        if not reconstruct_brush_faces(brush):
+            invalid += 1
+            continue
+        sides: list[str] = []
+        for face in brush:
+            polygon = face["polygon"]
+            best = None
+            best_area = 0.0
+            for candidate in itertools.combinations(polygon, 3):
+                cross = _cross(_vsub(candidate[1], candidate[0]), _vsub(candidate[2], candidate[0]))
+                area = math.sqrt(_dot(cross, cross))
+                if area > best_area:
+                    best, best_area = candidate, area
+            if best is None or best_area < 1e-5:
+                sides = []
+                break
+            p0, p1, p2 = best
+            if _dot(_cross(_vsub(p1, p0), _vsub(p2, p0)), face["plane"][0]) < 0:
+                p1, p2 = p2, p1
+            transformed = [
+                (
+                    -(point[1] - center[1]) * scale,
+                    (point[0] - center[0]) * scale,
+                    (point[2] - center[2]) * scale,
+                )
+                for point in (p0, p1, p2)
+            ]
+            plane_text = " ".join("(" + " ".join(f"{value:.9g}" for value in point) + ")" for point in transformed)
+            sides.append(
+                f'side\n{{\n"id" "{side_id}"\n"plane" "{plane_text}"\n'
+                '"material" "TOOLS/TOOLSNODRAW"\n'
+                '"uaxis" "[1 0 0 0] 0.25"\n"vaxis" "[0 -1 0 0] 0.25"\n'
+                '"rotation" "0"\n"lightmapscale" "16"\n"smoothing_groups" "0"\n}\n'
+            )
+            side_id += 1
+        if sides:
+            solids.append(f'solid\n{{\n"id" "{solid_id}"\n' + "".join(sides) + '}\n')
+            solid_id += 1
+        else:
+            invalid += 1
+
+    vmf_text = model_vmf.read_text(encoding="utf-8")
+    world_start = vmf_text.find("world\n{")
+    if world_start < 0:
+        raise NeoFormatError(f"could not find world block in {model_vmf}")
+    depth = 0
+    world_end = None
+    for pos in range(vmf_text.find("{", world_start), len(vmf_text)):
+        if vmf_text[pos] == "{":
+            depth += 1
+        elif vmf_text[pos] == "}":
+            depth -= 1
+            if depth == 0:
+                world_end = pos
+                break
+    if world_end is None:
+        raise NeoFormatError(f"unterminated world block in {model_vmf}")
+    destination.write_text(
+        vmf_text[:world_end] + "".join(solids) + vmf_text[world_end:], encoding="utf-8"
+    )
+    return {
+        "output": str(destination), "input_brushes": len(brushes),
+        "collision_brushes": len(solids), "invalid_brushes": invalid,
+        "material": "TOOLS/TOOLSNODRAW",
+    }
+
+
+def export_decompiled_vmf(
+    neo: NeoFile, map_path: Path, destination: Path, scale: float,
+    max_texture_size: int = 1024,
+) -> dict:
+    brushes = parse_decompiled_world_brushes(map_path)
+    samples = neo_surface_samples(neo, max_texture_size)
+    grid: dict[tuple[int, int, int], list[dict]] = {}
+    grid_size = 256.0
+    for sample in samples:
+        low = [math.floor(min(point[axis] for point in sample["points"]) / grid_size) for axis in range(3)]
+        high = [math.floor(max(point[axis] for point in sample["points"]) / grid_size) for axis in range(3)]
+        cells = math.prod(high[axis] - low[axis] + 1 for axis in range(3))
+        if cells <= 64:
+            for key in itertools.product(*(range(low[axis], high[axis] + 1) for axis in range(3))):
+                grid.setdefault(key, []).append(sample)
+        else:
+            key = tuple(math.floor(value / grid_size) for value in sample["center"])
+            grid.setdefault(key, []).append(sample)
+
+    vertices = neo.vertices()
+    logical = neo.lumps[1].count or len(vertices)
+    position_vertices = vertices[:min(logical, len(vertices))]
+    center = tuple(
+        (min(point[i] for point in position_vertices) + max(point[i] for point in position_vertices)) * 0.5
+        for i in range(3)
+    )
+    special = {
+        "null": "TOOLS/TOOLSNODRAW", "clip": "TOOLS/TOOLSCLIP",
+        "aaatrigger": "TOOLS/TOOLSTRIGGER", "sky": "TOOLS/TOOLSSKYBOX",
+    }
+    matched = unmatched = invalid = 0
+    confidence_rows: list[dict] = []
+    brush_materials: set[str] = set()
+    solids: list[str] = []
+    solid_id, side_id = 2, 100000
+    for brush in brushes:
+        if not reconstruct_brush_faces(brush):
+            invalid += 1
+            continue
+        sides: list[str] = []
+        for face in brush:
+            original = face["texture"].lower()
+            material = special.get(original)
+            match = None
+            if material is None and original.startswith("!"):
+                material = "TOOLS/TOOLSNODRAW"
+            if material is None:
+                c = face["center"]
+                polygon = face["polygon"]
+                low = [math.floor((min(point[axis] for point in polygon) - 16) / grid_size) for axis in range(3)]
+                high = [math.floor((max(point[axis] for point in polygon) + 16) / grid_size) for axis in range(3)]
+                candidates_by_id: dict[int, dict] = {}
+                cells = math.prod(high[axis] - low[axis] + 1 for axis in range(3))
+                if cells <= 512:
+                    for key in itertools.product(*(range(low[axis], high[axis] + 1) for axis in range(3))):
+                        for candidate in grid.get(key, ()):
+                            candidates_by_id[id(candidate)] = candidate
+                else:
+                    cell = tuple(math.floor(value / grid_size) for value in c)
+                    for delta in itertools.product(range(-2, 3), repeat=3):
+                        for candidate in grid.get(tuple(cell[i] + delta[i] for i in range(3)), ()):
+                            candidates_by_id[id(candidate)] = candidate
+                fn, _ = face["plane"]
+                dropped = _projection_axis(fn)
+                face_2d = _convex_hull_2d([_project_2d(point, dropped) for point in polygon])
+                face_area = _polygon_area_2d(face_2d)
+                material_areas: dict[str, float] = {}
+                material_samples: dict[str, list[tuple[float, dict]]] = {}
+                for sample in candidates_by_id.values():
+                    alignment = abs(_dot(fn, sample["normal"]))
+                    plane_error = abs(abs(_dot(sample["normal"], c) - sample["distance"]))
+                    if alignment < 0.985 or plane_error > 4.0:
+                        continue
+                    triangle_2d = _convex_hull_2d([
+                        _project_2d(point, dropped) for point in sample["points"]
+                    ])
+                    overlap = _convex_intersection_area(triangle_2d, face_2d)
+                    if overlap <= 1e-5:
+                        continue
+                    weighted = overlap * alignment / (1.0 + plane_error)
+                    name = sample["material"]
+                    material_areas[name] = material_areas.get(name, 0.0) + overlap
+                    material_samples.setdefault(name, []).append((weighted, sample))
+                total_overlap = sum(material_areas.values())
+                winner = max(material_areas, key=material_areas.get) if material_areas else None
+                winner_area = material_areas.get(winner, 0.0) if winner else 0.0
+                coverage = min(1.0, total_overlap / face_area) if face_area > 1e-6 else 0.0
+                dominance = winner_area / total_overlap if total_overlap > 1e-6 else 0.0
+                confidence = coverage * dominance
+                if winner and coverage >= 0.30 and dominance >= 0.60 and confidence >= 0.24:
+                    match = max(material_samples[winner], key=lambda item: item[0])[1]
+                    base_material = f"models/neo_maps/{neo.path.stem}/{match['material']}"
+                    material = base_material + "_brush"
+                    brush_materials.add(match["material"])
+                    matched += 1
+                else:
+                    material = "NEO_TRANSFER/MANUAL_MISSING"
+                    unmatched += 1
+                confidence_rows.append({
+                    "original_texture": face["texture"], "center": list(c),
+                    "material": match["material"] if match else None,
+                    "coverage": round(coverage, 5), "dominance": round(dominance, 5),
+                    "confidence": round(confidence, 5), "accepted": match is not None,
+                })
+
+            polygon = face["polygon"]
+            best = None
+            best_area = 0.0
+            for candidate in itertools.combinations(polygon, 3):
+                area = math.sqrt(_dot(_cross(_vsub(candidate[1], candidate[0]), _vsub(candidate[2], candidate[0])),
+                                      _cross(_vsub(candidate[1], candidate[0]), _vsub(candidate[2], candidate[0]))))
+                if area > best_area:
+                    best, best_area = candidate, area
+            if best is None or best_area < 1e-5:
+                sides = []
+                break
+            p0, p1, p2 = best
+            fn = face["plane"][0]
+            if _dot(_cross(_vsub(p1, p0), _vsub(p2, p0)), fn) < 0:
+                p1, p2 = p2, p1
+            transformed = [
+                (
+                    -(p[1] - center[1]) * scale,
+                    (p[0] - center[0]) * scale,
+                    (p[2] - center[2]) * scale,
+                )
+                for p in (p0, p1, p2)
+            ]
+            plane_text = " ".join("(" + " ".join(f"{v:.9g}" for v in p) + ")" for p in transformed)
+            uaxis, vaxis = "[1 0 0 0] 0.25", "[0 -1 0 0] 0.25"
+            if match is not None:
+                u_values = [uv[0] * match["width"] for uv in match["uv"]]
+                # VMF texture axes use Source's world-projection convention;
+                # unlike SMD/OBJ UVs, applying 1-V here vertically mirrors the
+                # fitted brush material. Preserve the native NEO V direction.
+                v_values = [uv[1] * match["height"] for uv in match["uv"]]
+                uaxis = fitted_texture_axis(match, u_values, center, scale) or uaxis
+                vaxis = fitted_texture_axis(match, v_values, center, scale) or vaxis
+            sides.append(
+                f'side\n{{\n"id" "{side_id}"\n"plane" "{plane_text}"\n'
+                f'"material" "{material}"\n"uaxis" "{uaxis}"\n"vaxis" "{vaxis}"\n'
+                '"rotation" "0"\n"lightmapscale" "16"\n"smoothing_groups" "0"\n}\n'
+            )
+            side_id += 1
+        if sides:
+            solids.append(f'solid\n{{\n"id" "{solid_id}"\n' + "".join(sides) + '}\n')
+            solid_id += 1
+        else:
+            invalid += 1
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    material_dir = destination.parent / "materials" / "models" / "neo_maps" / neo.path.stem
+    material_dir.mkdir(parents=True, exist_ok=True)
+    for material_name in brush_materials:
+        (material_dir / f"{material_name}_brush.vmt").write_text(
+            '"LightmappedGeneric"\n{\n'
+            f'    "$basetexture" "models/neo_maps/{neo.path.stem}/{material_name}"\n'
+            '}\n',
+            encoding="utf-8",
+        )
+    destination.write_text(
+        'versioninfo\n{\n"editorversion" "400"\n"editorbuild" "0"\n"mapversion" "1"\n'
+        '"formatversion" "100"\n"prefab" "0"\n}\n'
+        'visgroups\n{\n}\nviewsettings\n{\n"bSnapToGrid" "1"\n"bShowGrid" "1"\n'
+        '"bShowLogicalGrid" "0"\n"nGridSpacing" "16"\n"bShow3DGrid" "0"\n}\n'
+        'world\n{\n"id" "1"\n"mapversion" "1"\n"classname" "worldspawn"\n'
+        '"skyname" "sky_day01_01"\n' + "".join(solids) + '}\n'
+        'cameras\n{\n"activecamera" "-1"\n}\ncordons\n{\n"active" "0"\n}\n',
+        encoding="utf-8",
+    )
+    confidence_path = destination.with_name(destination.stem + "_matches.json")
+    confidence_path.write_text(json.dumps(confidence_rows, indent=2), encoding="utf-8")
+    return {"output": str(destination), "input_brushes": len(brushes), "written_brushes": len(solids),
+            "invalid_brushes": invalid, "matched_faces": matched, "unmatched_faces": unmatched,
+            "neo_surface_samples": len(samples), "brush_materials": len(brush_materials),
+            "match_report": str(confidence_path)}
+
+
 def find_game_directory(source_bin: Path, override: Path | None) -> Path:
     if override is not None:
         game_dir = override.resolve()
@@ -793,6 +1305,7 @@ def compile_hammer_output(
     tool_timeout: float,
     verbose: bool,
     max_vtf_size: int,
+    compile_models: bool = True,
 ) -> dict:
     def log(message: str) -> None:
         if verbose:
@@ -900,7 +1413,9 @@ def compile_hammer_output(
         log(f"  vtex {status} after {time.monotonic() - started:.1f}s")
 
     model_jobs: list[dict] = []
-    qcs = sorted((hammer_dir / "modelsrc").rglob("*.qc"))
+    qcs = sorted((hammer_dir / "modelsrc").rglob("*.qc")) if compile_models else []
+    if not compile_models:
+        log("Skipping model compilation for textured-brush workflow")
     for qc_number, qc in enumerate(qcs, 1):
         qc = qc.resolve()
         log(f"Model {qc_number}/{len(qcs)}: {qc.name}")
@@ -1031,6 +1546,10 @@ def command_export(args: argparse.Namespace) -> int:
         raise NeoFormatError("--hammer uses native Source coordinates and cannot be combined with an axis option")
     if args.source_bin and not args.hammer:
         raise NeoFormatError("--source-bin requires --hammer")
+    if args.decompiled_map and not args.hammer:
+        raise NeoFormatError("--decompiled-map requires --hammer")
+    if args.decompiled_map and not args.decompiled_map.is_file():
+        raise NeoFormatError(f"decompiled MAP file was not found: {args.decompiled_map}")
     if (args.game_dir or args.ffmpeg) and not args.source_bin:
         raise NeoFormatError("--game-dir and --ffmpeg require --source-bin")
     if args.tool_timeout <= 0:
@@ -1054,10 +1573,18 @@ def command_export(args: argparse.Namespace) -> int:
         report["hammer"] = export_hammer(
             neo, args.output / "hammer", args.scale, args.flip_v
         )
+        if args.decompiled_map:
+            report["textured_brushes"] = export_decompiled_vmf(
+                neo, args.decompiled_map,
+                args.output / "hammer" / f"{args.input.stem}_brushes.vmf",
+                args.scale,
+                args.max_vtf_size,
+            )
         if args.source_bin:
             report["hammer_compile"] = compile_hammer_output(
                 args.output / "hammer", args.source_bin, args.game_dir, args.ffmpeg,
                 args.tool_timeout, args.verbose, args.max_vtf_size,
+                compile_models=not bool(args.decompiled_map),
             )
     report_path = args.output / f"{args.input.stem}.json"
     report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
@@ -1113,6 +1640,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="also generate Source SMD/QC/VMT files and a prop_static VMF scaffold",
     )
     export_parser.add_argument(
+        "--decompiled-map",
+        type=Path,
+        metavar="PATH",
+        help="create a textured Source brush VMF from a decompiled GoldSrc .map using NEO geometry matching",
+    )
+    export_parser.add_argument(
         "--source-bin",
         type=Path,
         metavar="PATH",
@@ -1147,7 +1680,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1024,
         metavar="PIXELS",
-        help="proportionally resize larger textures before vtex (default: 1024)",
+        help="resize textures down to Source-compatible power-of-two dimensions (default limit: 1024)",
     )
     export_parser.set_defaults(func=command_export)
     return parser
