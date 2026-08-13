@@ -478,7 +478,10 @@ def indexed_runs(command: DrawCommand, indices: Sequence[int]) -> tuple[int, lis
     return base_vertex, runs
 
 
-def export_hammer(neo: NeoFile, destination: Path, scale: float, flip_v: bool) -> dict:
+def export_hammer(
+    neo: NeoFile, destination: Path, scale: float, flip_v: bool,
+    export_all_textures: bool = False,
+) -> dict:
     """Write an initial Source SDK model/material/VMF conversion scaffold."""
     vertices = neo.vertices()
     texcoords = neo.texcoords()
@@ -499,9 +502,11 @@ def export_hammer(neo: NeoFile, destination: Path, scale: float, flip_v: bool) -
     material_rel = f"models/{model_rel}"
     modelsrc = destination / "modelsrc" / model_rel
     materials = destination / "materials" / material_rel
+    brush_materials_dir = destination / "materials" / model_rel
     materialsrc = destination / "materialsrc" / material_rel
     modelsrc.mkdir(parents=True, exist_ok=True)
     materials.mkdir(parents=True, exist_ok=True)
+    brush_materials_dir.mkdir(parents=True, exist_ok=True)
     materialsrc.mkdir(parents=True, exist_ok=True)
 
     texture_outputs = extract_textures(neo, destination.parent / "textures")
@@ -626,7 +631,7 @@ def export_hammer(neo: NeoFile, destination: Path, scale: float, flip_v: bool) -
         })
 
     for index, texture in textures.items():
-        if index not in used_diffuse_textures:
+        if not export_all_textures and index not in used_diffuse_textures:
             continue
         material = f"neo_{index:04d}_{texture.name}"
         vmt = materials / f"{material}.vmt"
@@ -635,6 +640,14 @@ def export_hammer(neo: NeoFile, destination: Path, scale: float, flip_v: bool) -
             f'    "$basetexture" "{material_rel}/{material}"\n'
             '}\n', encoding="utf-8"
         )
+        if export_all_textures:
+            # Keep world-brush aliases outside materials/models. Hammer treats
+            # that tree as model-only and may hide or fail to preview its VMTs.
+            (brush_materials_dir / f"{material}_brush.vmt").write_text(
+                '"LightmappedGeneric"\n{\n'
+                f'    "$basetexture" "{material_rel}/{material}"\n'
+                '}\n', encoding="utf-8"
+            )
         source = extracted.get(index)
         if source and source.is_file():
             shutil.copyfile(source, materialsrc / f"{material}{source.suffix.lower()}")
@@ -816,6 +829,121 @@ def parse_decompiled_world_brushes(path: Path) -> list[list[dict]]:
         if plane:
             current.append({"points": points, "texture": match.group(4), "plane": plane})
     return brushes
+
+
+def parse_decompiled_entities(path: Path) -> list[dict]:
+    """Parse top-level Valve MAP entities, their keyvalues, and brush planes."""
+    entities: list[dict] = []
+    current: dict | None = None
+    current_brush: list[dict] | None = None
+    depth = 0
+    keyvalue_re = re.compile(r'^\s*"([^"]+)"\s+"([^"]*)"')
+    for line in path.read_text(encoding="latin-1", errors="replace").splitlines():
+        stripped = line.strip()
+        if stripped == "{":
+            depth += 1
+            if depth == 1:
+                current = {"keyvalues": {}, "brushes": []}
+            elif depth == 2 and current is not None:
+                current_brush = []
+            continue
+        if stripped == "}":
+            if depth == 2 and current is not None and current_brush is not None:
+                if current_brush:
+                    current["brushes"].append(current_brush)
+                current_brush = None
+            elif depth == 1 and current is not None:
+                entities.append(current)
+                current = None
+            depth -= 1
+            continue
+        if current is None:
+            continue
+        if depth == 1:
+            match = keyvalue_re.match(line)
+            if match:
+                current["keyvalues"][match.group(1)] = match.group(2)
+        elif depth == 2 and current_brush is not None:
+            match = MAP_FACE_RE.match(line)
+            if not match:
+                continue
+            try:
+                points = [tuple(map(float, match.group(i).split())) for i in range(1, 4)]
+            except ValueError:
+                continue
+            plane = _plane(points)
+            if plane:
+                current_brush.append({"points": points, "texture": match.group(4), "plane": plane})
+    return entities
+
+
+def export_bsp_location_names(bsp_path: Path, destination: Path) -> dict:
+    """Recover NEO PLACE_NAME labels from a GoldSrc BSP entity lump."""
+    data = bsp_path.read_bytes()
+    if len(data) < 12:
+        raise NeoFormatError(f"BSP file is too small: {bsp_path}")
+    version = struct.unpack_from("<i", data, 0)[0]
+    entity_offset, entity_length = struct.unpack_from("<ii", data, 4)
+    if (entity_offset < 0 or entity_length < 0 or
+            entity_offset + entity_length > len(data)):
+        raise NeoFormatError(f"invalid BSP entity lump bounds: {bsp_path}")
+
+    entity_lump = data[entity_offset:entity_offset + entity_length]
+    entities: list[dict] = []
+    by_id: dict[str, dict] = {}
+    for block in re.findall(br"\{[^{}]*\}", entity_lump, re.DOTALL):
+        raw_values = dict(re.findall(br'"([^"]+)"\s+"([^"]*)"', block))
+        source_class = raw_values.get(b"classname", b"").decode("ascii", errors="replace")
+        if source_class.upper() != "PLACE_NAME":
+            continue
+        location_id = raw_values.get(b"id", b"").decode("ascii", errors="replace")
+        raw_name = raw_values.get(b"name", b"")
+        name = raw_name.decode("cp932", errors="replace")
+        model = raw_values.get(b"model", b"").decode("ascii", errors="replace")
+        row = {
+            "id": location_id,
+            "name": name,
+            "model": model,
+            "name_cp932_hex": raw_name.hex(),
+        }
+        entities.append(row)
+        grouped = by_id.setdefault(location_id, {"id": location_id, "names": [], "models": []})
+        if name not in grouped["names"]:
+            grouped["names"].append(name)
+        if model and model not in grouped["models"]:
+            grouped["models"].append(model)
+
+    def id_sort_key(item: dict) -> tuple[int, int | str]:
+        value = item["id"]
+        return (0, int(value)) if value.isdigit() else (1, value)
+
+    payload = {
+        "source_bsp": str(bsp_path),
+        "bsp_version": version,
+        "encoding": "CP932 (Shift-JIS)",
+        "location_count": len(entities),
+        "unique_id_count": len(by_id),
+        "locations_by_id": sorted(by_id.values(), key=id_sort_key),
+        "entities": entities,
+    }
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    return {"output": str(destination), "locations": len(entities), "unique_ids": len(by_id)}
+
+
+def _source_point(point, center, scale):
+    return (-(point[1] - center[1]) * scale,
+            (point[0] - center[0]) * scale,
+            (point[2] - center[2]) * scale)
+
+
+def _source_angles(value: str) -> str:
+    try:
+        pitch, yaw, roll = map(float, value.split())
+    except (ValueError, TypeError):
+        return value
+    yaw = (yaw + 90.0) % 360.0
+    return f"{pitch:.9g} {yaw:.9g} {roll:.9g}"
 
 
 def reconstruct_brush_faces(brush: list[dict]) -> bool:
@@ -1079,6 +1207,7 @@ def export_decompiled_vmf(
     max_texture_size: int = 1024,
 ) -> dict:
     brushes = parse_decompiled_world_brushes(map_path)
+    map_entities = parse_decompiled_entities(map_path)
     samples = neo_surface_samples(neo, max_texture_size)
     grid: dict[tuple[int, int, int], list[dict]] = {}
     grid_size = 256.0
@@ -1165,7 +1294,7 @@ def export_decompiled_vmf(
                 confidence = coverage * dominance
                 if winner and coverage >= 0.30 and dominance >= 0.60 and confidence >= 0.24:
                     match = max(material_samples[winner], key=lambda item: item[0])[1]
-                    base_material = f"models/neo_maps/{neo.path.stem}/{match['material']}"
+                    base_material = f"neo_maps/{neo.path.stem}/{match['material']}"
                     material = base_material + "_brush"
                     brush_materials.add(match["material"])
                     matched += 1
@@ -1223,8 +1352,219 @@ def export_decompiled_vmf(
             solid_id += 1
         else:
             invalid += 1
+
+    entity_class_map = {
+        "info_player_start": "info_player_start",
+        "info_player_deathmatch": "info_player_deathmatch",
+        "light_environment": "light_environment",
+        "env_sprite": "env_sprite",
+        "trigger_push": "trigger_push",
+        "trigger_relay": "logic_relay",
+        "training_trigger_once": "trigger_once",
+        "training_breakable": "func_breakable",
+        "training_door": "func_door",
+        "func_ladder": "func_ladder",
+        "func_illusionary": "func_brush",
+        "func_wall": "func_brush",
+        "func_water": "func_water_analog",
+        "func_buyzone": "func_buyzone",
+        "path_corner": "path_corner",
+        "trigger_changetarget": "trigger_changetarget",
+        "multi_manager": "logic_relay",
+        "trigger_multiple": "trigger_multiple",
+        "func_wall_toggle": "func_brush",
+        "func_breakable": "func_breakable",
+        "light": "light",
+        "func_button": "func_button",
+        "info_teleport_destination": "info_teleport_destination",
+        "func_door": "func_door",
+        "ambient_generic": "ambient_generic",
+        "trigger_teleport": "trigger_teleport",
+        "func_bomb_target": "func_bomb_target",
+        "env_explosion": "env_explosion",
+        "trigger_once": "trigger_once",
+        "game_zone_player": "game_zone_player",
+        "game_counter": "math_counter",
+        "trigger_hurt": "trigger_hurt",
+        "func_conveyor": "func_conveyor",
+        "func_rotating": "func_rotating",
+        "game_counter_set": "math_counter",
+        "env_render": "env_render",
+        "env_shake": "env_shake",
+        "button_target": "func_button",
+        "env_spark": "env_spark",
+        "info_target": "info_target",
+        "trigger_camera": "point_viewcontrol",
+        "training_wall_toggle": "func_brush",
+        # NEO uses brush volumes to associate areas of a map with location
+        # names shown by its HUD.  Source has no directly portable generic
+        # PLACE_NAME entity, so retain the volume as a non-solid trigger.  The
+        # original name/id are copied to metadata below for Hammer and scripts.
+        "PLACE_NAME": "trigger_multiple",
+    }
+    brush_material_by_class = {
+        # Garry's Mod does not ship the SDK's TOOLSLADDER VMT. The func_ladder
+        # entity supplies ladder behavior; keep its volume invisible with nodraw.
+        "func_ladder": "TOOLS/TOOLSNODRAW",
+        "trigger_push": "TOOLS/TOOLSTRIGGER",
+        "trigger_once": "TOOLS/TOOLSTRIGGER",
+        "trigger_multiple": "TOOLS/TOOLSTRIGGER",
+        "trigger_hurt": "TOOLS/TOOLSTRIGGER",
+        "trigger_teleport": "TOOLS/TOOLSTRIGGER",
+        "PLACE_NAME": "TOOLS/TOOLSTRIGGER",
+        "game_zone_player": "TOOLS/TOOLSTRIGGER",
+        "func_bomb_target": "TOOLS/TOOLSTRIGGER",
+        "func_water_analog": "TOOLS/TOOLSNODRAW",
+    }
+    ignored_keys = {"classname", "wad", "mapversion", "rendermode", "renderamt", "rendercolor"}
+    targets_by_name: dict[str, str] = {}
+    for item in map_entities[1:]:
+        item_values = item["keyvalues"]
+        name = item_values.get("targetname")
+        mapped = entity_class_map.get(item_values.get("classname", ""))
+        if name and mapped:
+            targets_by_name[name] = mapped
+
+    def target_input(name: str) -> str:
+        return {
+            "logic_relay": "Trigger", "func_door": "Toggle", "func_brush": "Toggle",
+            "func_button": "Press", "ambient_generic": "ToggleSound",
+            "env_sprite": "ToggleSprite", "func_breakable": "Break",
+            "math_counter": "Add", "env_explosion": "Explode",
+        }.get(targets_by_name.get(name, ""), "Trigger")
+
+    entity_texts: list[str] = []
+    unsupported_classes: dict[str, int] = {}
+    converted_classes: dict[str, int] = {}
+    manual_review_rows: list[dict] = []
+    entity_id = max(solid_id + 1, 500000)
+    entity_side_id = max(side_id + 1, 600000)
+    for source_entity in map_entities[1:]:
+        values = source_entity["keyvalues"]
+        source_class = values.get("classname", "")
+        target_class = entity_class_map.get(source_class)
+        if target_class is None:
+            unsupported_classes[source_class or "<missing>"] = unsupported_classes.get(source_class or "<missing>", 0) + 1
+            manual_review_rows.append({"classname": source_class or "<missing>",
+                                       "keyvalues": values,
+                                       "brushes": len(source_entity["brushes"])})
+            # Preserve uncertain brush entities as visible manual-review
+            # func_brushes. Preserve point entities only when they have a useful
+            # origin; metadata-only helpers remain in the JSON review report.
+            if source_entity["brushes"]:
+                target_class = "func_brush"
+            elif "origin" in values:
+                target_class = "info_target"
+            else:
+                continue
+        converted_classes[target_class] = converted_classes.get(target_class, 0) + 1
+        parts = [f'entity\n{{\n"id" "{entity_id}"\n"classname" "{target_class}"\n']
+        if source_class == "PLACE_NAME":
+            place_id = values.get("id", "unknown")
+            original_name = values.get("name", "")
+            safe_place_id = re.sub(r"[^A-Za-z0-9_]+", "_", place_id).strip("_") or "unknown"
+            parts.append(f'"targetname" "neo_location_{safe_place_id}_{entity_id}"\n')
+            parts.append(f'"_neo_location_id" "{place_id.replace(chr(34), chr(39))}"\n')
+            if original_name:
+                parts.append(f'"_neo_location_name" "{original_name.replace(chr(34), chr(39))}"\n')
+            # A negative wait prevents repeated automatic firing.  Outputs can
+            # be added manually later if a port needs location notifications.
+            parts.append('"spawnflags" "1"\n')
+            parts.append('"wait" "-1"\n')
+        output_target = values.get("target")
+        for key, value in values.items():
+            if key.lower() in ignored_keys:
+                continue
+            if key in {"target", "killtarget"}:
+                continue
+            if source_class == "PLACE_NAME" and key in {"name", "id", "targetname", "wait"}:
+                continue
+            if key == "origin":
+                try:
+                    point = tuple(map(float, value.split()))
+                    value = " ".join(f"{coordinate:.9g}" for coordinate in _source_point(point, center, scale))
+                except ValueError:
+                    pass
+            elif key == "angles":
+                value = _source_angles(value)
+            # Common GoldSrc-to-Source key translations.
+            if key == "spawnflags":
+                target_key = "_neo_spawnflags_original"
+            elif key == "master":
+                target_key = "_neo_master_manual"
+            else:
+                target_key = {"movesnd": "movesnd", "health": "health", "speed": "speed",
+                              "wait": "wait", "targetname": "targetname"}.get(key, key)
+            escaped = value.replace('"', "'")
+            parts.append(f'"{target_key}" "{escaped}"\n')
+        manual_review_entity = source_class not in entity_class_map
+        if manual_review_entity:
+            parts.append(f'"_neo_original_class" "{source_class}"\n"_neo_manual_review" "1"\n')
+        if output_target:
+            output_name = {
+                "logic_relay": "OnTrigger", "trigger_once": "OnTrigger",
+                "trigger_multiple": "OnTrigger", "trigger_push": "OnStartTouch",
+                "func_button": "OnPressed", "func_breakable": "OnBreak",
+                "func_door": "OnOpen", "math_counter": "OnHitMax",
+            }.get(target_class, "OnTrigger")
+            parts.append(f'"{output_name}" "{output_target},{target_input(output_target)},,0,-1"\n')
+        if source_class == "multi_manager":
+            standard = {"classname", "origin", "targetname", "spawnflags", "master"}
+            for target, delay in values.items():
+                if target in standard:
+                    continue
+                try:
+                    float(delay)
+                except ValueError:
+                    continue
+                parts.append(f'"OnTrigger" "{target},{target_input(target)},,{delay},-1"\n')
+        if target_class == "func_brush" and source_class == "func_illusionary":
+            parts.append('"Solidity" "1"\n')
+        elif target_class == "func_brush" and manual_review_entity:
+            # Unknown brush triggers/helpers are retained for inspection but
+            # must not create accidental invisible collision in the port.
+            parts.append('"Solidity" "1"\n')
+        if target_class == "func_breakable" and "material" not in values:
+            parts.append('"material" "0"\n')
+        entity_brushes = 0
+        for brush in source_entity["brushes"]:
+            if not reconstruct_brush_faces(brush):
+                continue
+            brush_sides: list[str] = []
+            for face in brush:
+                polygon = face["polygon"]
+                best = max(
+                    itertools.combinations(polygon, 3),
+                    key=lambda candidate: _dot(
+                        _cross(_vsub(candidate[1], candidate[0]), _vsub(candidate[2], candidate[0])),
+                        _cross(_vsub(candidate[1], candidate[0]), _vsub(candidate[2], candidate[0])),
+                    ),
+                    default=None,
+                )
+                if best is None:
+                    brush_sides = []
+                    break
+                p0, p1, p2 = best
+                if _dot(_cross(_vsub(p1, p0), _vsub(p2, p0)), face["plane"][0]) < 0:
+                    p1, p2 = p2, p1
+                transformed = [_source_point(point, center, scale) for point in (p0, p1, p2)]
+                plane_text = " ".join("(" + " ".join(f"{v:.9g}" for v in p) + ")" for p in transformed)
+                face_material = brush_material_by_class.get(target_class, "NEO_TRANSFER/MANUAL_MISSING")
+                brush_sides.append(
+                    f'side\n{{\n"id" "{entity_side_id}"\n"plane" "{plane_text}"\n'
+                    f'"material" "{face_material}"\n'
+                    '"uaxis" "[1 0 0 0] 0.25"\n"vaxis" "[0 -1 0 0] 0.25"\n'
+                    '"rotation" "0"\n"lightmapscale" "16"\n"smoothing_groups" "0"\n}\n'
+                )
+                entity_side_id += 1
+            if brush_sides:
+                parts.append(f'solid\n{{\n"id" "{entity_id + entity_brushes + 1}"\n' + "".join(brush_sides) + '}\n')
+                entity_brushes += 1
+        parts.append('}\n')
+        entity_texts.append("".join(parts))
+        entity_id += max(1, entity_brushes + 1)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    material_dir = destination.parent / "materials" / "models" / "neo_maps" / neo.path.stem
+    material_dir = destination.parent / "materials" / "neo_maps" / neo.path.stem
     material_dir.mkdir(parents=True, exist_ok=True)
     for material_name in brush_materials:
         (material_dir / f"{material_name}_brush.vmt").write_text(
@@ -1240,15 +1580,21 @@ def export_decompiled_vmf(
         '"bShowLogicalGrid" "0"\n"nGridSpacing" "16"\n"bShow3DGrid" "0"\n}\n'
         'world\n{\n"id" "1"\n"mapversion" "1"\n"classname" "worldspawn"\n'
         '"skyname" "sky_day01_01"\n' + "".join(solids) + '}\n'
+        + "".join(entity_texts) +
         'cameras\n{\n"activecamera" "-1"\n}\ncordons\n{\n"active" "0"\n}\n',
         encoding="utf-8",
     )
     confidence_path = destination.with_name(destination.stem + "_matches.json")
     confidence_path.write_text(json.dumps(confidence_rows, indent=2), encoding="utf-8")
+    entity_review_path = destination.with_name(destination.stem + "_entity_review.json")
+    entity_review_path.write_text(json.dumps(manual_review_rows, indent=2), encoding="utf-8")
     return {"output": str(destination), "input_brushes": len(brushes), "written_brushes": len(solids),
             "invalid_brushes": invalid, "matched_faces": matched, "unmatched_faces": unmatched,
             "neo_surface_samples": len(samples), "brush_materials": len(brush_materials),
-            "match_report": str(confidence_path)}
+            "match_report": str(confidence_path), "entities": len(entity_texts),
+            "converted_entity_classes": converted_classes,
+            "unsupported_entity_classes": unsupported_classes,
+            "entity_review": str(entity_review_path)}
 
 
 def find_game_directory(source_bin: Path, override: Path | None) -> Path:
@@ -1350,6 +1696,10 @@ def compile_hammer_output(
     active_materials = {
         item["material"] for item in json.loads(manifest_file.read_text(encoding="utf-8"))
     }
+    # A decompiled-brush export may stage every NEO texture so it can be
+    # selected manually in Hammer even if no draw command currently uses it.
+    active_materials.update(vmt.stem.removesuffix("_brush") for vmt in
+                            (hammer_dir / "materials").rglob("*.vmt"))
     images = sorted(
         image for image in source_root.rglob("*")
         if image.is_file() and image.stem in active_materials
@@ -1550,6 +1900,8 @@ def command_export(args: argparse.Namespace) -> int:
         raise NeoFormatError("--decompiled-map requires --hammer")
     if args.decompiled_map and not args.decompiled_map.is_file():
         raise NeoFormatError(f"decompiled MAP file was not found: {args.decompiled_map}")
+    if args.location_bsp and not args.location_bsp.is_file():
+        raise NeoFormatError(f"location BSP file was not found: {args.location_bsp}")
     if (args.game_dir or args.ffmpeg) and not args.source_bin:
         raise NeoFormatError("--game-dir and --ffmpeg require --source-bin")
     if args.tool_timeout <= 0:
@@ -1571,7 +1923,8 @@ def command_export(args: argparse.Namespace) -> int:
         report["textures"] = extract_textures(neo, args.output / "textures")
     if args.hammer:
         report["hammer"] = export_hammer(
-            neo, args.output / "hammer", args.scale, args.flip_v
+            neo, args.output / "hammer", args.scale, args.flip_v,
+            export_all_textures=bool(args.decompiled_map),
         )
         if args.decompiled_map:
             report["textured_brushes"] = export_decompiled_vmf(
@@ -1584,8 +1937,13 @@ def command_export(args: argparse.Namespace) -> int:
             report["hammer_compile"] = compile_hammer_output(
                 args.output / "hammer", args.source_bin, args.game_dir, args.ffmpeg,
                 args.tool_timeout, args.verbose, args.max_vtf_size,
-                compile_models=not bool(args.decompiled_map),
             )
+    if args.location_bsp:
+        location_dir = args.output / "hammer" if args.hammer else args.output
+        report["locations"] = export_bsp_location_names(
+            args.location_bsp,
+            location_dir / f"{args.input.stem}_locations.json",
+        )
     report_path = args.output / f"{args.input.stem}.json"
     report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(json.dumps({"report": str(report_path), **report["geometry"]}, indent=2))
@@ -1644,6 +2002,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         metavar="PATH",
         help="create a textured Source brush VMF from a decompiled GoldSrc .map using NEO geometry matching",
+    )
+    export_parser.add_argument(
+        "--location-bsp",
+        type=Path,
+        metavar="PATH",
+        help="recover CP932 PLACE_NAME labels and location IDs from the original GoldSrc BSP into JSON",
     )
     export_parser.add_argument(
         "--source-bin",
