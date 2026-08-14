@@ -877,6 +877,84 @@ def parse_decompiled_entities(path: Path) -> list[dict]:
     return entities
 
 
+def parse_decompiled_vmf_entities(path: Path) -> list[dict]:
+    """Parse J.A.C.K/Source VMF world and entity brushes into MAP-like data."""
+    root = {"name": "root", "keyvalues": {}, "children": []}
+    stack = [root]
+    pending_name: str | None = None
+    keyvalue_re = re.compile(r'^\s*"([^"]+)"\s+"([^"]*)"')
+    block_name_re = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*$")
+
+    for line_number, line in enumerate(
+            path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("//"):
+            continue
+        match = keyvalue_re.match(line)
+        if match:
+            # VMF allows repeated output keys. The NEO entity translator only
+            # consumes ordinary scalar keys, so retain the last value here.
+            stack[-1]["keyvalues"][match.group(1)] = match.group(2)
+            continue
+        if stripped == "{":
+            if pending_name is None:
+                raise NeoFormatError(f"VMF block without a name at {path}:{line_number}")
+            child = {"name": pending_name.lower(), "keyvalues": {}, "children": []}
+            stack[-1]["children"].append(child)
+            stack.append(child)
+            pending_name = None
+            continue
+        if stripped == "}":
+            if len(stack) == 1:
+                raise NeoFormatError(f"unexpected VMF closing brace at {path}:{line_number}")
+            stack.pop()
+            pending_name = None
+            continue
+        match = block_name_re.match(line)
+        if match:
+            pending_name = match.group(1)
+
+    if len(stack) != 1:
+        raise NeoFormatError(f"unclosed VMF block in {path}")
+
+    plane_re = re.compile(r"\(([^)]*)\)\s*\(([^)]*)\)\s*\(([^)]*)\)")
+
+    def brushes_from_node(node: dict) -> list[list[dict]]:
+        brushes: list[list[dict]] = []
+        for solid in (child for child in node["children"] if child["name"] == "solid"):
+            brush: list[dict] = []
+            for side in (child for child in solid["children"] if child["name"] == "side"):
+                plane_text = side["keyvalues"].get("plane", "")
+                match = plane_re.fullmatch(plane_text.strip())
+                if not match:
+                    continue
+                try:
+                    points = [tuple(map(float, match.group(index).split())) for index in range(1, 4)]
+                except ValueError:
+                    continue
+                plane = _plane(points)
+                if plane:
+                    brush.append({
+                        "points": points,
+                        "texture": side["keyvalues"].get("material", "NULL"),
+                        "plane": plane,
+                        "vmf_uaxis": side["keyvalues"].get("uaxis"),
+                        "vmf_vaxis": side["keyvalues"].get("vaxis"),
+                    })
+            if brush:
+                brushes.append(brush)
+        return brushes
+
+    entities: list[dict] = []
+    world = next((child for child in root["children"] if child["name"] == "world"), None)
+    if world is None:
+        raise NeoFormatError(f"VMF contains no world block: {path}")
+    entities.append({"keyvalues": dict(world["keyvalues"]), "brushes": brushes_from_node(world)})
+    for node in (child for child in root["children"] if child["name"] == "entity"):
+        entities.append({"keyvalues": dict(node["keyvalues"]), "brushes": brushes_from_node(node)})
+    return entities
+
+
 def export_bsp_location_names(bsp_path: Path, destination: Path) -> dict:
     """Recover NEO PLACE_NAME labels from a GoldSrc BSP entity lump."""
     data = bsp_path.read_bytes()
@@ -1206,8 +1284,12 @@ def export_decompiled_vmf(
     neo: NeoFile, map_path: Path, destination: Path, scale: float,
     max_texture_size: int = 1024,
 ) -> dict:
-    brushes = parse_decompiled_world_brushes(map_path)
-    map_entities = parse_decompiled_entities(map_path)
+    if map_path.suffix.lower() == ".vmf":
+        map_entities = parse_decompiled_vmf_entities(map_path)
+        brushes = map_entities[0]["brushes"]
+    else:
+        brushes = parse_decompiled_world_brushes(map_path)
+        map_entities = parse_decompiled_entities(map_path)
     samples = neo_surface_samples(neo, max_texture_size)
     grid: dict[tuple[int, int, int], list[dict]] = {}
     grid_size = 256.0
@@ -1892,14 +1974,15 @@ def command_inspect(args: argparse.Namespace) -> int:
 
 def command_export(args: argparse.Namespace) -> int:
     neo = NeoFile.read(args.input)
+    decompiled_input = args.decompiled_vmf or args.decompiled_map
     if args.hammer and (args.blender_axes or args.source_axes):
         raise NeoFormatError("--hammer uses native Source coordinates and cannot be combined with an axis option")
     if args.source_bin and not args.hammer:
         raise NeoFormatError("--source-bin requires --hammer")
-    if args.decompiled_map and not args.hammer:
-        raise NeoFormatError("--decompiled-map requires --hammer")
-    if args.decompiled_map and not args.decompiled_map.is_file():
-        raise NeoFormatError(f"decompiled MAP file was not found: {args.decompiled_map}")
+    if decompiled_input and not args.hammer:
+        raise NeoFormatError("--decompiled-map/--decompiled-vmf requires --hammer")
+    if decompiled_input and not decompiled_input.is_file():
+        raise NeoFormatError(f"decompiled map file was not found: {decompiled_input}")
     if args.location_bsp and not args.location_bsp.is_file():
         raise NeoFormatError(f"location BSP file was not found: {args.location_bsp}")
     if (args.game_dir or args.ffmpeg) and not args.source_bin:
@@ -1924,11 +2007,11 @@ def command_export(args: argparse.Namespace) -> int:
     if args.hammer:
         report["hammer"] = export_hammer(
             neo, args.output / "hammer", args.scale, args.flip_v,
-            export_all_textures=bool(args.decompiled_map),
+            export_all_textures=bool(decompiled_input),
         )
-        if args.decompiled_map:
+        if decompiled_input:
             report["textured_brushes"] = export_decompiled_vmf(
-                neo, args.decompiled_map,
+                neo, decompiled_input,
                 args.output / "hammer" / f"{args.input.stem}_brushes.vmf",
                 args.scale,
                 args.max_vtf_size,
@@ -1997,11 +2080,18 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="also generate Source SMD/QC/VMT files and a prop_static VMF scaffold",
     )
-    export_parser.add_argument(
+    decompiled_group = export_parser.add_mutually_exclusive_group()
+    decompiled_group.add_argument(
         "--decompiled-map",
         type=Path,
         metavar="PATH",
         help="create a textured Source brush VMF from a decompiled GoldSrc .map using NEO geometry matching",
+    )
+    decompiled_group.add_argument(
+        "--decompiled-vmf",
+        type=Path,
+        metavar="PATH",
+        help="create a textured Source brush VMF from a J.A.C.K-converted VMF using NEO geometry matching",
     )
     export_parser.add_argument(
         "--location-bsp",

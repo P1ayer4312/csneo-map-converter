@@ -44,6 +44,19 @@ python neo_map_converter.py export `
     --verbose
 ```
 
+If the decompiled MAP was converted with J.A.C.K, provide its VMF instead:
+
+```powershell
+python neo_map_converter.py export `
+    linux\czero\maps\neo_00collision.neo `
+    converted\neo_00collision_gmod `
+    --hammer `
+    --decompiled-vmf decompiled\neo_00collision.vmf `
+    --location-bsp linux\czero\maps\neo_00collision.bsp
+```
+
+`--decompiled-map` and `--decompiled-vmf` are mutually exclusive.
+
 Use `--ffmpeg C:\path\to\ffmpeg.exe` if FFmpeg is not available through `PATH`.
 
 ## Output
