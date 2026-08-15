@@ -240,33 +240,17 @@ def resolve_mesh_material(
     mesh: tuple[int, ...],
     texinfos: Sequence[TexInfo],
 ) -> tuple[TexInfo | None, int | None, int | None, str | None]:
-    """Resolve direct texinfo materials and shader-property diffuse fallbacks."""
+    """Resolve the default material for a mesh.
+
+    Optimized NEO shaders can bind several diffuse maps to one draw.  The
+    per-vertex selector for those maps is handled separately by
+    ``resolve_mesh_diffuse_slots``/``selected_diffuse_texture``.
+    """
     info = texinfos[mesh[3]] if 0 <= mesh[3] < len(texinfos) else None
     texture_index = info.texture_index if info and info.texture_index >= 0 else None
-    shader_id = None
-    shader_name = None
-    attributes = neo.lump_data(11)
-    attribute_index = mesh[35]
-    if 0 <= attribute_index < len(attributes) // 80:
-        property_count, property_start, shader_id = struct.unpack_from(
-            "<III", attributes, attribute_index * 80
-        )
-        shader_names = neo.fx_shader_names()
-        if 0 <= shader_id < len(shader_names):
-            shader_name = shader_names[shader_id]
-        if texture_index is None:
-            properties = neo.lump_data(13)
-            for property_index in range(property_start, property_start + property_count):
-                offset = property_index * 136
-                if offset + 136 > len(properties):
-                    break
-                name = bytes(properties[offset + 28 : offset + 136]).split(b"\0", 1)[0]
-                name = name.decode("latin-1", errors="replace").lower()
-                if name in {"diffusemap", "diffusetexture", "basetexture"}:
-                    candidate = struct.unpack_from("<I", properties, offset + 24)[0]
-                    if candidate != 0xFFFFFFFF:
-                        texture_index = candidate
-                        break
+    slots, shader_id, shader_name = resolve_mesh_diffuse_slots(neo, mesh, texinfos)
+    if slots:
+        texture_index = slots[min(slots)]
     # Some shader-driven surfaces have no direct diffuse texture and inherit
     # runtime state that is not serialized in texinfo. Their paired lightmap is
     # still self-contained and has a matching UV stream, so use it as a visible
@@ -277,6 +261,110 @@ def resolve_mesh_material(
             info = secondary
             texture_index = secondary.texture_index
     return info, texture_index, shader_id, shader_name
+
+
+def resolve_mesh_diffuse_slots(
+    neo: NeoFile,
+    mesh: tuple[int, ...],
+    texinfos: Sequence[TexInfo],
+) -> tuple[dict[int, int], int | None, str | None]:
+    """Return ``diffuseMapN`` texture bindings for one mesh attribute.
+
+    Reverse engineering ``loadAttributes`` established that the first three
+    uint32 values in an 80-byte serialized attribute are shader id, property
+    start, and property count (in that order).
+    """
+    slots: dict[int, int] = {}
+    explicit_slots: dict[int, int] = {}
+    info = texinfos[mesh[3]] if 0 <= mesh[3] < len(texinfos) else None
+    if info and info.texture_index >= 0:
+        slots[0] = info.texture_index
+    shader_id = None
+    shader_name = None
+    attributes = neo.lump_data(11)
+    attribute_index = mesh[35]
+    if 0 <= attribute_index < len(attributes) // 80:
+        shader_id, property_start, property_count = struct.unpack_from(
+            "<III", attributes, attribute_index * 80
+        )
+        shader_names = neo.fx_shader_names()
+        if 0 <= shader_id < len(shader_names):
+            shader_name = shader_names[shader_id]
+        properties = neo.lump_data(13)
+        if len(properties) >= 4:
+            serialized_count = struct.unpack_from("<I", properties, 0)[0]
+            table_end = 4 + serialized_count * 4
+            if serialized_count <= 100_000 and table_end <= len(properties):
+                offsets = struct.unpack_from(f"<{serialized_count}I", properties, 4)
+                for property_index in range(
+                        property_start, min(property_start + property_count, serialized_count)):
+                    offset = offsets[property_index]
+                    end = offsets[property_index + 1] if property_index + 1 < serialized_count else len(properties)
+                    if offset < table_end or end > len(properties) or end - offset < 136:
+                        continue
+                    # Explicit effect properties are the sampler bindings used
+                    # by the renderer and override texinfo's fallback texture.
+                    name = bytes(properties[offset:offset + 128]).split(b"\0", 1)[0]
+                    name = name.decode("latin-1", errors="replace").lower()
+                    match = re.fullmatch(r"diffusemap(\d*)", name)
+                    water_normal = bool(
+                        shader_name and "water" in shader_name.lower() and name == "normalmap"
+                    )
+                    if match or name in {"diffusetexture", "basetexture"} or water_normal:
+                        candidate = struct.unpack_from("<I", properties, offset + 132)[0]
+                        if candidate != 0xFFFFFFFF:
+                            slot = int(match.group(1) or 0) if match else 0
+                            explicit_slots[slot] = candidate
+    # Texinfo is only a renderer-state fallback.  When an effect serialized its
+    # sampler bindings explicitly, retaining the fallback as an extra slot can
+    # make layered shaders select an unrelated texture (notably effects whose
+    # first real sampler is diffuseMap1 rather than diffuseMap0).
+    if explicit_slots:
+        slots = explicit_slots
+    return slots, shader_id, shader_name
+
+
+def diffuse_selector_start(
+    mesh: tuple[int, ...], info: TexInfo | None, texinfos: Sequence[TexInfo],
+    slots: dict[int, int],
+) -> int | None:
+    """Locate the packed TexCoord0.z selector stream used by OPT shaders."""
+    if info is None or len(slots) < 2 or not (0 <= mesh[4] < len(texinfos)):
+        return None
+    following = texinfos[mesh[4]].uv_start
+    span = following - info.uv_start
+    # TexCoord0 is a padded float4 stored as interleaved vec2 pairs per
+    # vertex: xy, then z/padding. TexCoord1 (the lightmap UV) follows it.
+    if info.flags != 2 or span <= 0 or span % 2:
+        return None
+    return info.uv_start + 1
+
+
+def mesh_texcoord_indices(
+    info: TexInfo, selector_start: int | None, local_vertex: int,
+) -> tuple[int, int | None]:
+    """Return UV and optional selector indices for a mesh-local vertex."""
+    stride = 2 if selector_start is not None else 1
+    uv_index = info.uv_start + local_vertex * stride
+    selector_index = selector_start + local_vertex * stride if selector_start is not None else None
+    return uv_index, selector_index
+
+
+def selected_diffuse_texture(
+    slots: dict[int, int], texcoords: Sequence[tuple[float, float]],
+    selector_indices: Sequence[int | None],
+) -> int | None:
+    """Choose a batched diffuse texture from a triangle's TexCoord0.z values."""
+    fallback = slots[min(slots)] if slots else None
+    values = sorted(
+        texcoords[index][0] for index in selector_indices
+        if index is not None and 0 <= index < len(texcoords)
+        and math.isfinite(texcoords[index][0])
+    )
+    if not values:
+        return fallback
+    slot = int(round(values[len(values) // 2]))
+    return slots.get(slot, fallback)
 
 
 def triangles_for_primitive(mode: int, values: Sequence) -> Iterable[tuple]:
@@ -333,6 +421,8 @@ def export_obj(
     written_faces = 0
     skipped_faces = 0
     unsupported_modes: set[int] = set()
+    luminance_alpha_textures: set[int] = set()
+    uniform_alpha_textures: set[int] = set()
 
     with destination.open("w", encoding="utf-8", newline="\n") as obj:
         obj.write(f"# Converted from {neo.path.name}\n")
@@ -349,7 +439,12 @@ def export_obj(
                 # Source/GoldSrc Y points left; mirror it for Blender's visual
                 # convention. NEO's stored strip winding is opposite Blender's,
                 # so the handedness change also corrects the visible face side.
-                obj.write(f"v {x * scale:.9g} {-y * scale:.9g} {z * scale:.9g}\n")
+                # Then rotate -90 degrees around Blender X so the map has the
+                # expected upright orientation in Blender.
+                # Finally mirror Blender X to match the map's intended left/
+                # right orientation. This restores handedness, so OBJ face
+                # winding is reversed below to keep surfaces outward-facing.
+                obj.write(f"v {-x * scale:.9g} {z * scale:.9g} {y * scale:.9g}\n")
             else:
                 obj.write(f"v {x * scale:.9g} {y * scale:.9g} {z * scale:.9g}\n")
 
@@ -365,19 +460,34 @@ def export_obj(
         for number, command in enumerate(commands):
             label = f"draw_command_{number:05d}"
             obj.write(f"{'o' if split_objects else 'g'} {label}\n")
+            info: TexInfo | None = None
             uv_start: int | None = None
             texture_index: int | None = None
+            active_material: str | None = None
             mesh_record = meshes_by_draw_id.get(number)
+            diffuse_slots: dict[int, int] = {}
+            selector_start: int | None = None
             if mesh_record is not None:
-                info, texture_index, _, _ = resolve_mesh_material(
+                info, texture_index, _, shader_name = resolve_mesh_material(
                     neo, mesh_record, texinfo_records
                 )
+                diffuse_slots, _, _ = resolve_mesh_diffuse_slots(
+                    neo, mesh_record, texinfo_records
+                )
+                if shader_name:
+                    lowered_shader = shader_name.lower()
+                    if "additive" in lowered_shader or "billboard" in lowered_shader:
+                        # NEO billboards commonly store an opaque black
+                        # background and rely on shader blending, just like its
+                        # additive effects (for example the ``helth`` marker).
+                        luminance_alpha_textures.update(diffuse_slots.values())
+                    elif "water" in lowered_shader or "translucent" in lowered_shader:
+                        uniform_alpha_textures.update(diffuse_slots.values())
                 if info is not None:
                     uv_start = info.uv_start
-                if texture_index is not None:
-                    texture = textures.get(texture_index)
-                    suffix = texture.name if texture else f"texture_{texture_index:04d}"
-                    obj.write(f"usemtl neo_{texture_index:04d}_{suffix}\n")
+                    selector_start = diffuse_selector_start(
+                        mesh_record, info, texinfo_records, diffuse_slots
+                    )
             if command.indexed:
                 # Indexed commands point at a small header in the index lump:
                 #   uint32 base_vertex, uint32 vertex_count, uint32 indices[]
@@ -396,16 +506,21 @@ def export_obj(
                             primitive_runs.append(run)
                             run = []
                     else:
-                        uv_index = uv_start + value if uv_start is not None else None
-                        run.append((base_vertex + value, uv_index))
+                        if info is not None:
+                            uv_index, selector_index = mesh_texcoord_indices(
+                                info, selector_start, value
+                            )
+                        else:
+                            uv_index = selector_index = None
+                        run.append((base_vertex + value, uv_index, selector_index))
                 if run:
                     primitive_runs.append(run)
             else:
                 end = command.start + command.count
                 primitive_runs = [[
-                    (vertex_index, uv_start + local if uv_start is not None else None)
+                    (vertex_index, *mesh_texcoord_indices(info, selector_start, local))
                     for local, vertex_index in enumerate(range(command.start, min(end, len(vertices))))
-                ]]
+                ]] if info is not None else []
 
             if command.mode not in {
                 GL_TRIANGLES, GL_TRIANGLE_STRIP, GL_TRIANGLE_FAN,
@@ -416,6 +531,8 @@ def export_obj(
 
             for values in primitive_runs:
                 for triangle in triangles_for_primitive(command.mode, values):
+                    if blender_axes:
+                        triangle = (triangle[0], triangle[2], triangle[1])
                     vertex_indices = tuple(item[0] for item in triangle)
                     uv_indices = tuple(item[1] for item in triangle)
                     if len(set(vertex_indices)) != 3 or any(index >= len(vertices) for index in vertex_indices):
@@ -428,10 +545,29 @@ def export_obj(
                         ]
                     else:
                         corners = [str(index + 1) for index in vertex_indices]
+                    face_texture = selected_diffuse_texture(
+                        diffuse_slots, texcoords, [item[2] for item in triangle]
+                    )
+                    if face_texture is None:
+                        face_texture = texture_index
+                    if face_texture is not None:
+                        texture = textures.get(face_texture)
+                        suffix = texture.name if texture else f"texture_{face_texture:04d}"
+                        face_material = f"neo_{face_texture:04d}_{suffix}"
+                        if face_material != active_material:
+                            obj.write(f"usemtl {face_material}\n")
+                            active_material = face_material
                     obj.write("f " + " ".join(corners) + "\n")
                     written_faces += 1
 
-    write_mtl(destination.with_suffix(".mtl"), textures)
+    alpha_textures = {
+        index for index, texture in textures.items()
+        if texture_has_alpha(neo, texture)
+    }
+    write_mtl(
+        destination.with_suffix(".mtl"), textures, alpha_textures,
+        luminance_alpha_textures, uniform_alpha_textures, neo,
+    )
 
     return {
         "output": str(destination),
@@ -442,10 +578,101 @@ def export_obj(
         "faces": written_faces,
         "skipped_faces": skipped_faces,
         "unsupported_primitive_modes": sorted(unsupported_modes),
+        "alpha_materials": len(
+            alpha_textures | luminance_alpha_textures | uniform_alpha_textures
+        ),
+        "shader_luminance_alpha_materials": len(luminance_alpha_textures),
     }
 
 
-def write_mtl(path: Path, textures: dict[int, TextureInfo]) -> None:
+def texture_has_alpha(neo: NeoFile, texture: TextureInfo) -> bool:
+    """Return whether a texture stores a usable alpha channel."""
+    # NEO lightmap alpha stores auxiliary baked-lighting information. It is
+    # not surface opacity, including when a missing diffuse texture causes the
+    # lightmap to be exported as a visible fallback.
+    if texture.name.lower().startswith("lightmap"):
+        return False
+    if texture.external_reference:
+        source = neo.path.parent.parent / "tex" / Path(texture.external_reference)
+        try:
+            data = source.read_bytes()
+        except OSError:
+            return False
+        header = data[:128]
+        suffix = source.suffix.lower()
+        if suffix == ".dds" and len(header) >= 108 and header[:4] == b"DDS ":
+            pixel_flags = struct.unpack_from("<I", header, 80)[0]
+            fourcc = header[84:88]
+            alpha_mask = struct.unpack_from("<I", header, 104)[0]
+            if pixel_flags & 0x1 or alpha_mask or fourcc in {b"DXT3", b"DXT5"}:
+                return True
+            if fourcc == b"DXT1":
+                width = struct.unpack_from("<I", header, 16)[0]
+                height = struct.unpack_from("<I", header, 12)[0]
+                block_count = ((width + 3) // 4) * ((height + 3) // 4)
+                for offset in range(128, min(128 + block_count * 8, len(data)), 8):
+                    if offset + 8 > len(data):
+                        break
+                    color0, color1, selectors = struct.unpack_from("<HHI", data, offset)
+                    # DXT1 enables transparent palette entry 3 only when
+                    # color0 <= color1 and at least one pixel selects entry 3.
+                    if color0 <= color1 and any(
+                            (selectors >> shift) & 0x3 == 3 for shift in range(0, 32, 2)):
+                        return True
+            return False
+        if suffix == ".tga" and len(header) >= 18:
+            return header[16] == 32 and bool(header[17] & 0x0F)
+        if suffix == ".png" and len(header) >= 26 and header[:8] == b"\x89PNG\r\n\x1a\n":
+            return header[25] in {4, 6}
+        return False
+
+    if texture.pixel_size != 4:
+        return False
+    blob = neo.lump_data(2)
+    pixel_start = texture.offset + 48
+    pixel_end = min(pixel_start + texture.width * texture.height * 4, texture.end)
+    if pixel_end <= pixel_start:
+        return False
+    return any(alpha < 255 for alpha in blob[pixel_start + 3:pixel_end:4])
+
+
+def write_mtl(
+    path: Path, textures: dict[int, TextureInfo], alpha_textures: set[int] | None = None,
+    luminance_alpha_textures: set[int] | None = None,
+    uniform_alpha_textures: set[int] | None = None,
+    neo: NeoFile | None = None,
+) -> None:
+    alpha_textures = alpha_textures or set()
+    luminance_alpha_textures = luminance_alpha_textures or set()
+    uniform_alpha_textures = uniform_alpha_textures or set()
+    additive_images: dict[int, str] = {}
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg and neo is not None:
+        texture_dir = path.parent / "textures"
+        texture_dir.mkdir(parents=True, exist_ok=True)
+        # Shader blend semantics take precedence over a DDS alpha declaration.
+        # Several NEO effect textures are encoded as RGBA but contain 255 in
+        # every alpha pixel; the runtime still makes their black background
+        # transparent through additive/billboard blending.
+        for index in luminance_alpha_textures:
+            texture = textures.get(index)
+            if texture is None or not texture.external_reference:
+                continue
+            source = neo.path.parent.parent / "tex" / Path(texture.external_reference)
+            output_name = f"{index:04d}_{texture.name}_additive.tga"
+            output = texture_dir / output_name
+            if not source.is_file():
+                continue
+            try:
+                result = subprocess.run(
+                    [ffmpeg, "-y", "-loglevel", "error", "-i", str(source),
+                     "-vf", "colorkey=0x000000:0.12:0.08,format=rgba", str(output)],
+                    text=True, capture_output=True, check=False, timeout=30,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+            if result.returncode == 0 and output.is_file():
+                additive_images[index] = f"textures/{output_name}"
     with path.open("w", encoding="utf-8", newline="\n") as mtl:
         mtl.write("# Materials recovered from the NEO embedded texture directory\n")
         for index, texture in sorted(textures.items()):
@@ -454,8 +681,19 @@ def write_mtl(path: Path, textures: dict[int, TextureInfo]) -> None:
             image = f"textures/{index:04d}_{texture.name}{extension.lower()}"
             mtl.write(f"\nnewmtl {material}\n")
             mtl.write("Ka 0.2 0.2 0.2\nKd 1.0 1.0 1.0\nKs 0.0 0.0 0.0\n")
-            mtl.write("d 1.0\nillum 1\n")
-            mtl.write(f"map_Kd {image}\n")
+            opacity_image = additive_images.get(index)
+            dissolve = 0.45 if index in uniform_alpha_textures and index not in alpha_textures else 1.0
+            mtl.write(f"d {dissolve:.2f}\nillum 1\n")
+            mtl.write(f"map_Kd {opacity_image or image}\n")
+            if index in luminance_alpha_textures:
+                # Additive NEO shaders commonly store glowing pixels on an
+                # opaque black background. Use image luminance as the closest
+                # portable OBJ opacity approximation to additive blending.
+                mtl.write(f"map_d {opacity_image}\n" if opacity_image else f"map_d -imfchan r {image}\n")
+            elif index in alpha_textures:
+                # Blender's OBJ importer uses map_d to connect the image alpha
+                # channel and select a transparent material blend mode.
+                mtl.write(f"map_d {image}\n")
 
 
 def indexed_runs(command: DrawCommand, indices: Sequence[int]) -> tuple[int, list[list[int]]]:
@@ -491,11 +729,14 @@ def export_hammer(
     meshes = {record[2]: record for record in neo.meshes()}
     textures = {item.index: item for item in neo.texture_info()}
     resolved_by_draw: dict[int, tuple[TexInfo | None, int | None, int | None, str | None]] = {}
+    diffuse_slots_by_draw: dict[int, dict[int, int]] = {}
     for draw_id, record in meshes.items():
         resolved = resolve_mesh_material(neo, record, texinfos)
         resolved_by_draw[draw_id] = resolved
+        diffuse_slots_by_draw[draw_id] = resolve_mesh_diffuse_slots(neo, record, texinfos)[0]
     used_diffuse_textures = {
-        resolved[1] for resolved in resolved_by_draw.values() if resolved[1] is not None
+        texture_index for slots in diffuse_slots_by_draw.values()
+        for texture_index in slots.values()
     }
     map_name = neo.path.stem
     model_rel = f"neo_maps/{map_name}"
@@ -536,6 +777,8 @@ def export_hammer(
         texture = textures.get(texture_index)
         texture_name = texture.name if texture else f"texture_{texture_index:04d}"
         material = f"neo_{texture_index:04d}_{texture_name}"
+        diffuse_slots = diffuse_slots_by_draw[number]
+        selector_start = diffuse_selector_start(mesh, info, texinfos, diffuse_slots)
         special = shader_name is not None or len(
             [value for value in mesh[3:35] if value >= 0]
         ) > 2 or any(
@@ -544,10 +787,13 @@ def export_hammer(
 
         if command.indexed:
             base_vertex, raw_runs = indexed_runs(command, indices)
-            runs = [[(base_vertex + value, info.uv_start + value) for value in run] for run in raw_runs]
+            runs = [[
+                (base_vertex + value, *mesh_texcoord_indices(info, selector_start, value))
+                for value in run
+            ] for run in raw_runs]
         else:
             end = min(command.start + command.count, len(vertices))
-            runs = [[(vertex_index, info.uv_start + local)
+            runs = [[(vertex_index, *mesh_texcoord_indices(info, selector_start, local))
                      for local, vertex_index in enumerate(range(command.start, end))]]
 
         triangles: list[tuple] = []
@@ -575,6 +821,16 @@ def export_hammer(
             smd.write('version 1\nnodes\n0 "root" -1\nend\nskeleton\ntime 0\n')
             smd.write("0 0 0 0 0 0 0\nend\ntriangles\n")
             for triangle in triangles:
+                face_texture_index = selected_diffuse_texture(
+                    diffuse_slots, texcoords, [corner[2] for corner in triangle]
+                )
+                if face_texture_index is None:
+                    face_texture_index = texture_index
+                face_texture = textures.get(face_texture_index)
+                face_texture_name = (
+                    face_texture.name if face_texture else f"texture_{face_texture_index:04d}"
+                )
+                face_material = f"neo_{face_texture_index:04d}_{face_texture_name}"
                 points = [vertices[corner[0]] for corner in triangle]
                 for point in points:
                     for axis in range(3):
@@ -593,7 +849,7 @@ def export_hammer(
                 if length <= 1e-12:
                     continue
                 normal = tuple(value / length for value in normal)
-                smd.write(material + "\n")
+                smd.write(face_material + "\n")
                 for corner, point in zip(triangle, points):
                     u, v = texcoords[corner[1]]
                     if flip_v:
@@ -623,6 +879,7 @@ def export_hammer(
         next_entity_id += 1
         manifest.append({
             "draw_command": number, "material": material, "texture": texture_name,
+            "diffuse_slots": diffuse_slots,
             "triangles": len(triangles), "special_shader_candidate": special,
             "neo_shader_id": shader_id,
             "neo_shader": shader_name,
@@ -1065,15 +1322,22 @@ def neo_surface_samples(neo: NeoFile, max_texture_size: int = 1024) -> list[dict
         if mesh is None:
             continue
         info, texture_index, _, _ = resolve_mesh_material(neo, mesh, texinfos)
-        texture = textures.get(texture_index) if texture_index is not None else None
-        if info is None or texture is None:
+        diffuse_slots, _, _ = resolve_mesh_diffuse_slots(neo, mesh, texinfos)
+        selector_start = diffuse_selector_start(mesh, info, texinfos, diffuse_slots)
+        if info is None or texture_index is None:
             continue
         if command.indexed:
             base, runs = indexed_runs(command, indices)
-            streams = [[(base + value, info.uv_start + value) for value in run] for run in runs]
+            streams = [[
+                (base + value, *mesh_texcoord_indices(info, selector_start, value))
+                for value in run
+            ] for run in runs]
         else:
             end = min(command.start + command.count, len(vertices))
-            streams = [[(value, info.uv_start + value - command.start) for value in range(command.start, end)]]
+            streams = [[
+                (value, *mesh_texcoord_indices(info, selector_start, value - command.start))
+                for value in range(command.start, end)
+            ]]
         for stream in streams:
             for triangle in triangles_for_primitive(command.mode, stream):
                 vi = [corner[0] for corner in triangle]
@@ -1081,6 +1345,14 @@ def neo_surface_samples(neo: NeoFile, max_texture_size: int = 1024) -> list[dict
                 if len(set(vi)) != 3 or any(v < 0 or v >= len(vertices) for v in vi):
                     continue
                 if any(u < 0 or u >= len(texcoords) for u in ui):
+                    continue
+                face_texture_index = selected_diffuse_texture(
+                    diffuse_slots, texcoords, [corner[2] for corner in triangle]
+                )
+                if face_texture_index is None:
+                    face_texture_index = texture_index
+                texture = textures.get(face_texture_index)
+                if texture is None:
                     continue
                 points = [vertices[v] for v in vi]
                 plane = _plane(points)
@@ -1282,7 +1554,7 @@ def export_collision_hybrid_vmf(
 
 def export_decompiled_vmf(
     neo: NeoFile, map_path: Path, destination: Path, scale: float,
-    max_texture_size: int = 1024,
+    max_texture_size: int = 1024, target_game: str = "gmod",
 ) -> dict:
     if map_path.suffix.lower() == ".vmf":
         map_entities = parse_decompiled_vmf_entities(map_path)
@@ -1484,6 +1756,13 @@ def export_decompiled_vmf(
         # original name/id are copied to metadata below for Hammer and scripts.
         "PLACE_NAME": "trigger_multiple",
     }
+    if target_game == "css":
+        # GoldSrc Counter-Strike uses start for CT and deathmatch for T.
+        # Counter-Strike: Source requires explicit team spawn classnames.
+        entity_class_map.update({
+            "info_player_start": "info_player_counterterrorist",
+            "info_player_deathmatch": "info_player_terrorist",
+        })
     brush_material_by_class = {
         # Garry's Mod does not ship the SDK's TOOLSLADDER VMT. The func_ladder
         # entity supplies ladder behavior; keep its volume invisible with nodraw.
@@ -1498,7 +1777,7 @@ def export_decompiled_vmf(
         "func_bomb_target": "TOOLS/TOOLSTRIGGER",
         "func_water_analog": "TOOLS/TOOLSNODRAW",
     }
-    ignored_keys = {"classname", "wad", "mapversion", "rendermode", "renderamt", "rendercolor"}
+    ignored_keys = {"classname", "id", "wad", "mapversion", "rendermode", "renderamt", "rendercolor"}
     targets_by_name: dict[str, str] = {}
     for item in map_entities[1:]:
         item_values = item["keyvalues"]
@@ -1676,7 +1955,7 @@ def export_decompiled_vmf(
             "match_report": str(confidence_path), "entities": len(entity_texts),
             "converted_entity_classes": converted_classes,
             "unsupported_entity_classes": unsupported_classes,
-            "entity_review": str(entity_review_path)}
+            "entity_review": str(entity_review_path), "target_game": target_game}
 
 
 def find_game_directory(source_bin: Path, override: Path | None) -> Path:
@@ -2015,6 +2294,7 @@ def command_export(args: argparse.Namespace) -> int:
                 args.output / "hammer" / f"{args.input.stem}_brushes.vmf",
                 args.scale,
                 args.max_vtf_size,
+                args.target_game,
             )
         if args.source_bin:
             report["hammer_compile"] = compile_hammer_output(
@@ -2054,7 +2334,7 @@ def build_parser() -> argparse.ArgumentParser:
     axes.add_argument(
         "--blender-axes",
         action="store_true",
-        help="mirror Source Y for Blender and preserve outward face winding",
+        help="orient for Blender with a clockwise X rotation and X mirror while preserving outward winding",
     )
     export_parser.add_argument(
         "--flip-v",
@@ -2079,6 +2359,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--hammer",
         action="store_true",
         help="also generate Source SMD/QC/VMT files and a prop_static VMF scaffold",
+    )
+    export_parser.add_argument(
+        "--target-game",
+        choices=("gmod", "css"),
+        default="gmod",
+        help="select target-specific entity mappings (default: gmod)",
     )
     decompiled_group = export_parser.add_mutually_exclusive_group()
     decompiled_group.add_argument(
