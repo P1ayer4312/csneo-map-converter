@@ -51,6 +51,12 @@ when writing OBJ/SMD geometry. The first three fields of each mesh-attribute
 record are the shader ID, effect-property start, and effect-property count.
 Shader-driven meshes may obtain their diffuse texture through those properties.
 
+Each 84-byte light record contains a position (`float3`), signed intensity,
+three RGBA color groups (primary/diffuse, secondary and ambient), and five
+reserved values. With `--transfer-lights`, positive records become Source point
+lights. Source has no dependable equivalent for NEO's negative/subtractive
+lights, so those are retained in the light-review report for manual handling.
+
 The optimized `OPT_LightmappedDiffuse2Cg.fx` shader batches as many as three
 diffuse materials into one draw command. Its `TexCoord0` is a padded float4:
 `xy` contains the ordinary UV while `z` selects `diffuseMap0`, `diffuseMap1`, or
@@ -113,6 +119,7 @@ python neo_map_converter.py export `
     converted\neo_00collision_gmod `
     --hammer `
     --decompiled-vmf decompiled\neo_00collision.vmf `
+    --transfer-lights `
     --location-bsp linux\czero\maps\neo_00collision.bsp
 ```
 
@@ -184,6 +191,7 @@ every lump without exporting anything.
 - `--target-game css`: Use Counter-Strike: Source mappings, including native T/CT spawn classes.
 - `--decompiled-map PATH`: Rebuild editable Source brushes and entities from a decompiled GoldSrc MAP, then assign NEO materials by geometric matching.
 - `--decompiled-vmf PATH`: Use a J.A.C.K-converted VMF as the brush/entity source instead of a MAP.
+- `--transfer-lights`: Add positive records from NEO lump 9 as Source `light` entities to the decompiled brush VMF. Subtractive/invalid records and clamped extreme intensities are listed in `*_light_review.json`.
 - `--location-bsp PATH`: Decode `PLACE_NAME` labels and IDs from the original BSP's CP932 entity data and export a UTF-8 location JSON.
 - `--source-bin PATH`: Locate `vtex.exe` and `studiomdl.exe` and automatically compile generated textures/models for the target Source game.
 - `--game-dir PATH`: Override the game directory containing `gameinfo.txt`; requires `--source-bin`.
@@ -195,6 +203,7 @@ every lump without exporting anything.
 
 `--source-axes` and `--blender-axes` are mutually exclusive. So are
 `--decompiled-map` and `--decompiled-vmf`. Decompiled brush conversion requires
-`--hammer`; `--game-dir` and `--ffmpeg` require `--source-bin`.
+`--hammer`; `--transfer-lights` additionally requires a decompiled MAP or VMF;
+`--game-dir` and `--ffmpeg` require `--source-bin`.
 
 Run `python neo_map_converter.py export --help` for every available option.

@@ -131,6 +131,17 @@ class TextureInfo:
     external_reference: str | None = None
 
 
+@dataclass(frozen=True)
+class NeoLight:
+    index: int
+    position: tuple[float, float, float]
+    intensity: float
+    diffuse: tuple[float, float, float, float]
+    secondary: tuple[float, float, float, float]
+    ambient: tuple[float, float, float, float]
+    reserved: tuple[float, float, float, float, float]
+
+
 class NeoFile:
     def __init__(self, path: Path, data: bytes):
         self.path = path
@@ -189,6 +200,17 @@ class NeoFile:
 
     def meshes(self) -> list[tuple[int, ...]]:
         return list(struct.iter_unpack("<36i", self.lump_data(5)))
+
+    def lights(self) -> list[NeoLight]:
+        """Decode the 84-byte renderer-light records from lump 9."""
+        return [
+            NeoLight(
+                index,
+                values[0:3], values[3], values[4:8], values[8:12],
+                values[12:16], values[16:21],
+            )
+            for index, values in enumerate(struct.iter_unpack("<21f", self.lump_data(9)))
+        ]
 
     def texture_info(self) -> list[TextureInfo]:
         blob = self.lump_data(2)
@@ -1555,6 +1577,7 @@ def export_collision_hybrid_vmf(
 def export_decompiled_vmf(
     neo: NeoFile, map_path: Path, destination: Path, scale: float,
     max_texture_size: int = 1024, target_game: str = "gmod",
+    transfer_lights: bool = False,
 ) -> dict:
     if map_path.suffix.lower() == ".vmf":
         map_entities = parse_decompiled_vmf_entities(map_path)
@@ -1924,6 +1947,58 @@ def export_decompiled_vmf(
         parts.append('}\n')
         entity_texts.append("".join(parts))
         entity_id += max(1, entity_brushes + 1)
+
+    light_review_rows: list[dict] = []
+    transferred_lights = 0
+    if transfer_lights:
+        for light in neo.lights():
+            values = (*light.position, light.intensity, *light.diffuse)
+            if not all(math.isfinite(value) for value in values):
+                light_review_rows.append({
+                    "index": light.index, "status": "skipped_non_finite",
+                    "position": list(light.position), "intensity": light.intensity,
+                })
+                continue
+            # Negative records represent subtractive renderer lights. VRAD's
+            # ordinary Source light entity has no reliable equivalent; adding
+            # their absolute value would brighten exactly the areas they were
+            # intended to darken.
+            if light.intensity <= 0:
+                light_review_rows.append({
+                    "index": light.index, "status": "manual_subtractive_or_disabled",
+                    "position": list(light.position), "intensity": light.intensity,
+                    "diffuse": list(light.diffuse),
+                })
+                continue
+            rgb = tuple(max(0, min(255, round(channel * 255))) for channel in light.diffuse[:3])
+            if not any(rgb):
+                light_review_rows.append({
+                    "index": light.index, "status": "skipped_black",
+                    "position": list(light.position), "intensity": light.intensity,
+                })
+                continue
+            # Most maps use values around 100-400. A handful contain values as
+            # high as 70000; preserving those literally makes VRAD output and
+            # the resulting map unusable, so retain the raw value as metadata.
+            brightness = min(2000.0, light.intensity)
+            origin = _source_point(light.position, center, scale)
+            entity_texts.append(
+                f'entity\n{{\n"id" "{entity_id}"\n"classname" "light"\n'
+                f'"origin" "{" ".join(f"{value:.9g}" for value in origin)}"\n'
+                f'"_light" "{rgb[0]} {rgb[1]} {rgb[2]} {brightness:.9g}"\n'
+                '}\n'
+            )
+            light_review_rows.append({
+                "index": light.index,
+                "status": "brightness_clamped" if brightness != light.intensity else "transferred",
+                "position": list(light.position), "intensity": light.intensity,
+                "exported_origin": list(origin), "exported_rgb": list(rgb),
+                "exported_brightness": brightness,
+                "secondary": list(light.secondary), "ambient": list(light.ambient),
+                "reserved": list(light.reserved),
+            })
+            entity_id += 1
+            transferred_lights += 1
     destination.parent.mkdir(parents=True, exist_ok=True)
     material_dir = destination.parent / "materials" / "neo_maps" / neo.path.stem
     material_dir.mkdir(parents=True, exist_ok=True)
@@ -1949,13 +2024,18 @@ def export_decompiled_vmf(
     confidence_path.write_text(json.dumps(confidence_rows, indent=2), encoding="utf-8")
     entity_review_path = destination.with_name(destination.stem + "_entity_review.json")
     entity_review_path.write_text(json.dumps(manual_review_rows, indent=2), encoding="utf-8")
+    light_review_path = destination.with_name(destination.stem + "_light_review.json")
+    if transfer_lights:
+        light_review_path.write_text(json.dumps(light_review_rows, indent=2), encoding="utf-8")
     return {"output": str(destination), "input_brushes": len(brushes), "written_brushes": len(solids),
             "invalid_brushes": invalid, "matched_faces": matched, "unmatched_faces": unmatched,
             "neo_surface_samples": len(samples), "brush_materials": len(brush_materials),
             "match_report": str(confidence_path), "entities": len(entity_texts),
             "converted_entity_classes": converted_classes,
             "unsupported_entity_classes": unsupported_classes,
-            "entity_review": str(entity_review_path), "target_game": target_game}
+            "entity_review": str(entity_review_path), "target_game": target_game,
+            "transferred_lights": transferred_lights,
+            "light_review": str(light_review_path) if transfer_lights else None}
 
 
 def find_game_directory(source_bin: Path, override: Path | None) -> Path:
@@ -2260,6 +2340,8 @@ def command_export(args: argparse.Namespace) -> int:
         raise NeoFormatError("--source-bin requires --hammer")
     if decompiled_input and not args.hammer:
         raise NeoFormatError("--decompiled-map/--decompiled-vmf requires --hammer")
+    if args.transfer_lights and not decompiled_input:
+        raise NeoFormatError("--transfer-lights requires --decompiled-map or --decompiled-vmf")
     if decompiled_input and not decompiled_input.is_file():
         raise NeoFormatError(f"decompiled map file was not found: {decompiled_input}")
     if args.location_bsp and not args.location_bsp.is_file():
@@ -2295,6 +2377,7 @@ def command_export(args: argparse.Namespace) -> int:
                 args.scale,
                 args.max_vtf_size,
                 args.target_game,
+                args.transfer_lights,
             )
         if args.source_bin:
             report["hammer_compile"] = compile_hammer_output(
@@ -2378,6 +2461,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         metavar="PATH",
         help="create a textured Source brush VMF from a J.A.C.K-converted VMF using NEO geometry matching",
+    )
+    export_parser.add_argument(
+        "--transfer-lights",
+        action="store_true",
+        help="add positive NEO renderer-light records as Source light entities to the decompiled brush VMF",
     )
     export_parser.add_argument(
         "--location-bsp",
