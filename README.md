@@ -107,7 +107,7 @@ python neo_map_converter.py export `
     converted\neo_02collision_gmod `
     --hammer `
     --decompiled-map decompiled\neo_02collision.map `
-    --location-bsp linux\czero\maps\neo_02collision.bsp `
+    --map-bsp linux\czero\maps\neo_02collision.bsp `
     --source-bin "C:\Program Files (x86)\Steam\steamapps\common\GarrysMod\bin" `
     --max-vtf-size 512 `
     --verbose
@@ -122,7 +122,7 @@ python neo_map_converter.py export `
     --hammer `
     --decompiled-vmf decompiled\neo_00collision.vmf `
     --transfer-lights `
-    --location-bsp linux\czero\maps\neo_00collision.bsp
+    --map-bsp linux\czero\maps\neo_00collision.bsp
 ```
 
 `--decompiled-map` and `--decompiled-vmf` are mutually exclusive.
@@ -139,7 +139,7 @@ python neo_map_converter.py export `
     --hammer --target-game css `
     --decompiled-vmf decompiled\neo_06collision.vmf `
     --overview linux\czero\overviews\neo_06collision.txt `
-    --location-bsp linux\czero\maps\neo_06collision.bsp `
+    --map-bsp linux\czero\maps\neo_06collision.bsp `
     --source-bin "C:\Program Files (x86)\Steam\steamapps\common\Counter-Strike Source\bin" `
     --max-vtf-size 512 --verbose
 ```
@@ -198,8 +198,9 @@ every lump without exporting anything.
 - `--target-game css`: Use Counter-Strike: Source mappings, including native T/CT spawn classes.
 - `--decompiled-map PATH`: Rebuild editable Source brushes and entities from a decompiled GoldSrc MAP, then assign NEO materials by geometric matching.
 - `--decompiled-vmf PATH`: Use a J.A.C.K-converted VMF as the brush/entity source instead of a MAP.
+- Decompiled `func_water` volumes are converted to Source `func_water_analog` brushes using the stock `NATURE/WATER_CANALS_CITY` material on the highest horizontal surface and `TOOLS/TOOLSNODRAW` on the remaining faces. Ambiguous water brushes are listed in the entity review JSON.
 - `--transfer-lights`: Add positive records from NEO lump 9 as Source `light` entities to the decompiled brush VMF. Subtractive/invalid records and clamped extreme intensities are listed in `*_light_review.json`.
-- `--location-bsp PATH`: Decode `PLACE_NAME` labels and IDs from the original BSP's CP932 entity data and export a UTF-8 location JSON.
+- `--map-bsp PATH`: Read reusable metadata from the original BSP. It currently recovers `PLACE_NAME` labels/IDs, transfers the worldspawn skybox, and exports a UTF-8 location JSON. The older `--location-bsp` spelling remains a compatibility alias.
 - `--overview PATH`: Convert a GoldSrc overview TXT and its referenced BMP into staged CS:S `resource/overviews` and `materials/overviews` radar assets. The asset name follows the clean decompiled brush BSP name. With `--source-bin`, the files are installed and the image is compiled automatically.
 - `--radar-rotate cw|ccw|180`: Optionally rotate the compiled radar image clockwise, counterclockwise, or 180 degrees. The default is no rotation; this option requires `--overview` and `--source-bin`.
 - `--source-bin PATH`: Locate `vtex.exe` and `studiomdl.exe` and automatically compile generated textures/models for the target Source game.

@@ -749,6 +749,7 @@ def export_hammer(
     vmf_name: str | None = None,
     override: bool = False,
     target_game: str = "gmod",
+    sky_name: str = "sky_day01_01",
 ) -> dict:
     """Write an initial Source SDK model/material/VMF conversion scaffold."""
     vertices = neo.vertices()
@@ -1029,7 +1030,7 @@ def export_hammer(
         'visgroups\n{\n}\nviewsettings\n{\n"bSnapToGrid" "1"\n"bShowGrid" "1"\n'
         '"bShowLogicalGrid" "0"\n"nGridSpacing" "64"\n}\n'
         'world\n{\n"id" "1"\n"mapversion" "1"\n"classname" "worldspawn"\n'
-        '"skyname" "sky_day01_01"\n' + world_solids + '}\n'
+        f'"skyname" "{sky_name}"\n' + world_solids + '}\n'
         + "".join(entities) + 'cameras\n{\n"activecamera" "-1"\n}\ncordons\n{\n"active" "0"\n}\n',
         encoding="utf-8",
     )
@@ -1255,8 +1256,8 @@ def parse_decompiled_vmf_entities(path: Path) -> list[dict]:
     return entities
 
 
-def export_bsp_location_names(bsp_path: Path, destination: Path) -> dict:
-    """Recover NEO PLACE_NAME labels from a GoldSrc BSP entity lump."""
+def read_bsp_entity_lump(bsp_path: Path) -> tuple[int, bytes]:
+    """Read and validate the GoldSrc BSP entity lump."""
     data = bsp_path.read_bytes()
     if len(data) < 12:
         raise NeoFormatError(f"BSP file is too small: {bsp_path}")
@@ -1265,8 +1266,37 @@ def export_bsp_location_names(bsp_path: Path, destination: Path) -> dict:
     if (entity_offset < 0 or entity_length < 0 or
             entity_offset + entity_length > len(data)):
         raise NeoFormatError(f"invalid BSP entity lump bounds: {bsp_path}")
+    return version, data[entity_offset:entity_offset + entity_length]
 
-    entity_lump = data[entity_offset:entity_offset + entity_length]
+
+def read_bsp_map_metadata(bsp_path: Path) -> dict:
+    """Recover reusable map-level metadata from the original BSP."""
+    version, entity_lump = read_bsp_entity_lump(bsp_path)
+    worldspawn: dict[str, str] = {}
+    for block in re.findall(br"\{[^{}]*\}", entity_lump, re.DOTALL):
+        raw_values = dict(re.findall(br'"([^"]+)"\s+"([^"]*)"', block))
+        classname = raw_values.get(b"classname", b"").decode("ascii", errors="replace")
+        if classname.lower() != "worldspawn":
+            continue
+        worldspawn = {
+            key.decode("ascii", errors="replace"): value.decode("cp932", errors="replace")
+            for key, value in raw_values.items()
+        }
+        break
+    sky_name = worldspawn.get("skyname", "").strip()
+    if sky_name and not re.fullmatch(r"[A-Za-z0-9_.-]+", sky_name):
+        sky_name = ""
+    return {
+        "bsp_version": version,
+        "worldspawn": worldspawn,
+        "sky_name": sky_name or None,
+    }
+
+
+def export_bsp_location_names(bsp_path: Path, destination: Path) -> dict:
+    """Recover NEO PLACE_NAME labels from a GoldSrc BSP entity lump."""
+    version, entity_lump = read_bsp_entity_lump(bsp_path)
+
     entities: list[dict] = []
     by_id: dict[str, dict] = {}
     for block in re.findall(br"\{[^{}]*\}", entity_lump, re.DOTALL):
@@ -1307,6 +1337,49 @@ def export_bsp_location_names(bsp_path: Path, destination: Path) -> dict:
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
     return {"output": str(destination), "locations": len(entities), "unique_ids": len(by_id)}
+
+
+def export_bsp_skybox(
+    bsp_path: Path, hammer_dir: Path, sky_name: str, override: bool = False,
+) -> dict:
+    """Stage the six GoldSrc skybox faces and Source VMT definitions."""
+    env_dir = bsp_path.parent.parent / "gfx" / "env"
+    materialsrc = hammer_dir / "materialsrc" / "skybox"
+    materials = hammer_dir / "materials" / "skybox"
+    materialsrc.mkdir(parents=True, exist_ok=True)
+    materials.mkdir(parents=True, exist_ok=True)
+    files_by_stem = {
+        item.stem.lower(): item for item in env_dir.iterdir()
+        if item.is_file() and item.suffix.lower() in (".tga", ".bmp")
+    } if env_dir.is_dir() else {}
+    faces = []
+    missing = []
+    for suffix in ("bk", "dn", "ft", "lf", "rt", "up"):
+        source = files_by_stem.get(f"{sky_name}{suffix}".lower())
+        if source is None:
+            missing.append(suffix)
+            continue
+        staged = materialsrc / f"{sky_name}{suffix}{source.suffix.lower()}"
+        skipped = staged.is_file() and not override
+        if not skipped:
+            shutil.copyfile(source, staged)
+        vmt = materials / f"{sky_name}{suffix}.vmt"
+        vmt.write_text(
+            '"UnlitGeneric"\n{\n'
+            f'    "$basetexture" "skybox/{sky_name}{suffix}"\n'
+            '    "$ignorez" "1"\n'
+            '    "$nofog" "1"\n'
+            '}\n',
+            encoding="utf-8",
+        )
+        faces.append({
+            "suffix": suffix, "source": str(source), "staged": str(staged),
+            "material": str(vmt), "skipped_existing": skipped,
+        })
+    return {
+        "sky_name": sky_name, "source_directory": str(env_dir),
+        "faces": faces, "missing_faces": missing, "complete": not missing,
+    }
 
 
 def _source_point(point, center, scale):
@@ -1598,7 +1671,7 @@ def export_collision_hybrid_vmf(
 def export_decompiled_vmf(
     neo: NeoFile, map_path: Path, destination: Path, scale: float,
     max_texture_size: int = 1024, target_game: str = "gmod",
-    transfer_lights: bool = False,
+    transfer_lights: bool = False, sky_name: str = "sky_day01_01",
 ) -> dict:
     if map_path.suffix.lower() == ".vmf":
         map_entities = parse_decompiled_vmf_entities(map_path)
@@ -1845,6 +1918,9 @@ def export_decompiled_vmf(
     manual_review_rows: list[dict] = []
     entity_id = max(solid_id + 1, 500000)
     entity_side_id = max(side_id + 1, 600000)
+    source_water_material = "NATURE/WATER_CANALS_CITY"
+    converted_water_brushes = 0
+    ambiguous_water_brushes = 0
     for source_entity in map_entities[1:]:
         values = source_entity["keyvalues"]
         source_class = values.get("classname", "")
@@ -1938,11 +2014,29 @@ def export_decompiled_vmf(
         if target_class == "func_breakable" and "material" not in values:
             parts.append('"material" "0"\n')
         entity_brushes = 0
-        for brush in source_entity["brushes"]:
+        for brush_index, brush in enumerate(source_entity["brushes"]):
             if not reconstruct_brush_faces(brush):
                 continue
+            water_top_index = None
+            if target_class == "func_water_analog":
+                horizontal_faces = [
+                    (index, sum(point[2] for point in face["polygon"]) / len(face["polygon"]))
+                    for index, face in enumerate(brush)
+                    if face.get("polygon") and abs(face["plane"][0][2]) >= 0.7
+                ]
+                if horizontal_faces:
+                    water_top_index = max(horizontal_faces, key=lambda item: item[1])[0]
+                    converted_water_brushes += 1
+                else:
+                    ambiguous_water_brushes += 1
+                    manual_review_rows.append({
+                        "classname": source_class,
+                        "reason": "water brush has no near-horizontal top face",
+                        "entity_id": entity_id,
+                        "brush_index": brush_index,
+                    })
             brush_sides: list[str] = []
-            for face in brush:
+            for face_index, face in enumerate(brush):
                 polygon = face["polygon"]
                 best = max(
                     itertools.combinations(polygon, 3),
@@ -1960,7 +2054,12 @@ def export_decompiled_vmf(
                     p1, p2 = p2, p1
                 transformed = [_source_point(point, center, scale) for point in (p0, p1, p2)]
                 plane_text = " ".join("(" + " ".join(f"{v:.9g}" for v in p) + ")" for p in transformed)
-                face_material = brush_material_by_class.get(target_class, "NEO_TRANSFER/MANUAL_MISSING")
+                if target_class == "func_water_analog" and face_index == water_top_index:
+                    face_material = source_water_material
+                else:
+                    face_material = brush_material_by_class.get(
+                        target_class, "NEO_TRANSFER/MANUAL_MISSING"
+                    )
                 brush_sides.append(
                     f'side\n{{\n"id" "{entity_side_id}"\n"plane" "{plane_text}"\n'
                     f'"material" "{face_material}"\n'
@@ -2104,7 +2203,7 @@ def export_decompiled_vmf(
         'visgroups\n{\n}\nviewsettings\n{\n"bSnapToGrid" "1"\n"bShowGrid" "1"\n'
         '"bShowLogicalGrid" "0"\n"nGridSpacing" "16"\n"bShow3DGrid" "0"\n}\n'
         'world\n{\n"id" "1"\n"mapversion" "1"\n"classname" "worldspawn"\n'
-        '"skyname" "sky_day01_01"\n' + "".join(solids) + '}\n'
+        f'"skyname" "{sky_name}"\n' + "".join(solids) + '}\n'
         + "".join(entity_texts) +
         'cameras\n{\n"activecamera" "-1"\n}\ncordons\n{\n"active" "0"\n}\n',
         encoding="utf-8",
@@ -2125,6 +2224,9 @@ def export_decompiled_vmf(
             "entity_review": str(entity_review_path), "target_game": target_game,
             "transferred_lights": transferred_lights,
             "generated_buyzones": generated_buyzones,
+            "water_material": source_water_material,
+            "converted_water_brushes": converted_water_brushes,
+            "ambiguous_water_brushes": ambiguous_water_brushes,
             "light_review": str(light_review_path) if transfer_lights else None}
 
 
@@ -2596,8 +2698,8 @@ def command_export(args: argparse.Namespace) -> int:
         raise NeoFormatError("--transfer-lights requires --decompiled-map or --decompiled-vmf")
     if decompiled_input and not decompiled_input.is_file():
         raise NeoFormatError(f"decompiled map file was not found: {decompiled_input}")
-    if args.location_bsp and not args.location_bsp.is_file():
-        raise NeoFormatError(f"location BSP file was not found: {args.location_bsp}")
+    if args.map_bsp and not args.map_bsp.is_file():
+        raise NeoFormatError(f"map BSP file was not found: {args.map_bsp}")
     if args.overview and not args.hammer:
         raise NeoFormatError("--overview requires --hammer")
     if args.overview and not args.overview.is_file():
@@ -2612,8 +2714,12 @@ def command_export(args: argparse.Namespace) -> int:
         raise NeoFormatError("--tool-timeout must be greater than zero")
     if args.max_vtf_size <= 0:
         raise NeoFormatError("--max-vtf-size must be greater than zero")
+    map_metadata = read_bsp_map_metadata(args.map_bsp) if args.map_bsp else {}
+    sky_name = map_metadata.get("sky_name") or "sky_day01_01"
     args.output.mkdir(parents=True, exist_ok=True)
     report = neo.report()
+    if map_metadata:
+        report["map_bsp"] = {"path": str(args.map_bsp), **map_metadata}
     report["geometry"] = export_obj(
         neo,
         args.output / f"{args.input.stem}.obj",
@@ -2635,6 +2741,7 @@ def command_export(args: argparse.Namespace) -> int:
             vmf_name=f"{args.input.stem}_models" if decompiled_input else None,
             override=override_textures,
             target_game=args.target_game,
+            sky_name=sky_name,
         )
         if decompiled_input:
             report["textured_brushes"] = export_decompiled_vmf(
@@ -2644,6 +2751,12 @@ def command_export(args: argparse.Namespace) -> int:
                 args.max_vtf_size,
                 args.target_game,
                 args.transfer_lights,
+                sky_name,
+            )
+        if args.map_bsp and map_metadata.get("sky_name"):
+            report["skybox"] = export_bsp_skybox(
+                args.map_bsp, args.output / "hammer", sky_name,
+                override_textures,
             )
         if args.overview:
             report["overview"] = export_css_overview(
@@ -2658,10 +2771,10 @@ def command_export(args: argparse.Namespace) -> int:
                 override_models=override_models,
                 radar_rotation=args.radar_rotate,
             )
-    if args.location_bsp:
+    if args.map_bsp:
         location_dir = args.output / "hammer" if args.hammer else args.output
         report["locations"] = export_bsp_location_names(
-            args.location_bsp,
+            args.map_bsp,
             location_dir / f"{args.input.stem}_locations.json",
         )
     report_path = args.output / f"{args.input.stem}.json"
@@ -2752,10 +2865,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="add positive NEO renderer-light records as Source light entities to the decompiled brush VMF",
     )
     export_parser.add_argument(
-        "--location-bsp",
+        "--map-bsp", "--location-bsp",
+        dest="map_bsp",
         type=Path,
         metavar="PATH",
-        help="recover CP932 PLACE_NAME labels and location IDs from the original GoldSrc BSP into JSON",
+        help=(
+            "read reusable metadata from the original GoldSrc BSP, including "
+            "locations and skybox; --location-bsp is a compatibility alias"
+        ),
     )
     export_parser.add_argument(
         "--overview",
