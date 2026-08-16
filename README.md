@@ -4,6 +4,8 @@ Experimental converter for the `.neo` rendering maps included with Counter-Strik
 
 The result is a reconstruction, not a finished port. Incorrect or low-confidence materials, gameplay logic, lighting, visibility and map optimization may require manual work in Hammer.
 
+The project is generated using GhidraMCP and Codex.
+
 ## NEO format overview
 
 A `.neo` file is a little-endian rendering-data container rather than a complete
@@ -19,24 +21,24 @@ The file begins with a 132-byte header:
 
 The sixteen lumps are:
 
-| Index | Contents                                | Record layout currently used                                |
-| ----: | --------------------------------------- | ----------------------------------------------------------- |
-|     0 | Vertex positions                        | Three `float32` values (12 bytes)                           |
-|     1 | Vertex colors/additional vertex stream  | Four `float32` values (16 bytes)                            |
-|     2 | Texture table and image data/references | Variable length                                             |
-|     3 | Scene nodes                             | 40-byte records                                             |
-|     4 | Texture information                     | UV start, texture index and flags (12 bytes)                |
-|     5 | Mesh records                            | 36 signed integers (144 bytes)                              |
-|     6 | Vertex indices                          | `uint32` (4 bytes)                                          |
-|     7 | Reserved/unknown                        | Variable length                                             |
-|     8 | Draw commands                           | OpenGL mode, start and signed count (12 bytes)              |
-|     9 | Lights                                  | 84-byte records                                             |
-|    10 | Texture coordinates                     | Two `float32` values (8 bytes)                              |
-|    11 | Mesh attributes                         | 80-byte records                                             |
-|    12 | Effect shader names                     | 132-byte records                                            |
+| Index | Contents                                | Record layout currently used                                                             |
+| ----: | --------------------------------------- | ---------------------------------------------------------------------------------------- |
+|     0 | Vertex positions                        | Three `float32` values (12 bytes)                                                        |
+|     1 | Vertex colors/additional vertex stream  | Four `float32` values (16 bytes)                                                         |
+|     2 | Texture table and image data/references | Variable length                                                                          |
+|     3 | Scene nodes                             | 40-byte records                                                                          |
+|     4 | Texture information                     | UV start, texture index and flags (12 bytes)                                             |
+|     5 | Mesh records                            | 36 signed integers (144 bytes)                                                           |
+|     6 | Vertex indices                          | `uint32` (4 bytes)                                                                       |
+|     7 | Reserved/unknown                        | Variable length                                                                          |
+|     8 | Draw commands                           | OpenGL mode, start and signed count (12 bytes)                                           |
+|     9 | Lights                                  | 84-byte records                                                                          |
+|    10 | Texture coordinates                     | Two `float32` values (8 bytes)                                                           |
+|    11 | Mesh attributes                         | 80-byte records                                                                          |
+|    12 | Effect shader names                     | 132-byte records                                                                         |
 |    13 | Effect shader properties                | Count/offset table followed by variable records; texture properties use 136-byte records |
-|    14 | Reserved/unknown                        | Variable length                                             |
-|    15 | Models                                  | 48-byte records                                             |
+|    14 | Reserved/unknown                        | Variable length                                                                          |
+|    15 | Models                                  | 48-byte records                                                                          |
 
 The texture lump starts with a texture count and an offset table. Each texture
 entry contains a 32-byte name, width, height, pixel size, format and payload.
@@ -127,7 +129,8 @@ python neo_map_converter.py export `
 
 For Counter-Strike: Source, add `--target-game css`. This converts GoldSrc
 `info_player_start`/`info_player_deathmatch` entities into native CS:S
-counter-terrorist/terrorist spawns. The default target remains `gmod`.
+counter-terrorist/terrorist spawns. It also adds adjacent T and CT spawn points
+to the generated `_models.vmf` scaffold. The default target remains `gmod`.
 
 ```powershell
 python neo_map_converter.py export `
@@ -135,6 +138,7 @@ python neo_map_converter.py export `
     converted\neo_06collision_css `
     --hammer --target-game css `
     --decompiled-vmf decompiled\neo_06collision.vmf `
+    --overview linux\czero\overviews\neo_06collision.txt `
     --location-bsp linux\czero\maps\neo_06collision.bsp `
     --source-bin "C:\Program Files (x86)\Steam\steamapps\common\Counter-Strike Source\bin" `
     --max-vtf-size 512 --verbose
@@ -186,6 +190,9 @@ every lump without exporting anything.
 - `--no-flip-v`: Preserve the raw NEO V values.
 - `--split-objects`: Write each draw command as a separately selectable OBJ object.
 - `--no-textures`: Skip the ordinary top-level texture extraction pass.
+- `--override models`: Recompile existing MDL assets while retaining cached textures/VTFs.
+- `--override textures`: Regenerate extracted textures and recompile existing VTF assets while retaining cached models.
+- `--override all` (or bare `--override`): Regenerate and recompile both models and textures. Without this option, existing assets are treated as cached and skipped.
 - `--hammer`: Also create Source SMD, QC, VMT and VMF files under `OUTPUT/hammer`.
 - `--target-game gmod`: Use the default Garry's Mod-compatible entity mappings.
 - `--target-game css`: Use Counter-Strike: Source mappings, including native T/CT spawn classes.
@@ -193,6 +200,8 @@ every lump without exporting anything.
 - `--decompiled-vmf PATH`: Use a J.A.C.K-converted VMF as the brush/entity source instead of a MAP.
 - `--transfer-lights`: Add positive records from NEO lump 9 as Source `light` entities to the decompiled brush VMF. Subtractive/invalid records and clamped extreme intensities are listed in `*_light_review.json`.
 - `--location-bsp PATH`: Decode `PLACE_NAME` labels and IDs from the original BSP's CP932 entity data and export a UTF-8 location JSON.
+- `--overview PATH`: Convert a GoldSrc overview TXT and its referenced BMP into staged CS:S `resource/overviews` and `materials/overviews` radar assets. The asset name follows the clean decompiled brush BSP name. With `--source-bin`, the files are installed and the image is compiled automatically.
+- `--radar-rotate cw|ccw|180`: Optionally rotate the compiled radar image clockwise, counterclockwise, or 180 degrees. The default is no rotation; this option requires `--overview` and `--source-bin`.
 - `--source-bin PATH`: Locate `vtex.exe` and `studiomdl.exe` and automatically compile generated textures/models for the target Source game.
 - `--game-dir PATH`: Override the game directory containing `gameinfo.txt`; requires `--source-bin`.
 - `--ffmpeg EXE`: Select FFmpeg explicitly for DDS conversion; requires `--source-bin`.
@@ -204,6 +213,7 @@ every lump without exporting anything.
 `--source-axes` and `--blender-axes` are mutually exclusive. So are
 `--decompiled-map` and `--decompiled-vmf`. Decompiled brush conversion requires
 `--hammer`; `--transfer-lights` additionally requires a decompiled MAP or VMF;
+`--overview` requires `--hammer` and FFmpeg is needed for automatic BMP conversion;
 `--game-dir` and `--ffmpeg` require `--source-bin`.
 
 Run `python neo_map_converter.py export --help` for every available option.

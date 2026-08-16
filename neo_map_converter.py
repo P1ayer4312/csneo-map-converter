@@ -426,6 +426,7 @@ def export_obj(
     blender_axes: bool,
     flip_v: bool,
     split_objects: bool,
+    override: bool = False,
 ) -> dict:
     vertices = neo.vertices()
     texcoords = neo.texcoords()
@@ -588,7 +589,7 @@ def export_obj(
     }
     write_mtl(
         destination.with_suffix(".mtl"), textures, alpha_textures,
-        luminance_alpha_textures, uniform_alpha_textures, neo,
+        luminance_alpha_textures, uniform_alpha_textures, neo, override,
     )
 
     return {
@@ -663,6 +664,7 @@ def write_mtl(
     luminance_alpha_textures: set[int] | None = None,
     uniform_alpha_textures: set[int] | None = None,
     neo: NeoFile | None = None,
+    override: bool = False,
 ) -> None:
     alpha_textures = alpha_textures or set()
     luminance_alpha_textures = luminance_alpha_textures or set()
@@ -683,6 +685,9 @@ def write_mtl(
             source = neo.path.parent.parent / "tex" / Path(texture.external_reference)
             output_name = f"{index:04d}_{texture.name}_additive.tga"
             output = texture_dir / output_name
+            if output.is_file() and not override:
+                additive_images[index] = f"textures/{output_name}"
+                continue
             if not source.is_file():
                 continue
             try:
@@ -741,6 +746,9 @@ def indexed_runs(command: DrawCommand, indices: Sequence[int]) -> tuple[int, lis
 def export_hammer(
     neo: NeoFile, destination: Path, scale: float, flip_v: bool,
     export_all_textures: bool = False,
+    vmf_name: str | None = None,
+    override: bool = False,
+    target_game: str = "gmod",
 ) -> dict:
     """Write an initial Source SDK model/material/VMF conversion scaffold."""
     vertices = neo.vertices()
@@ -772,7 +780,7 @@ def export_hammer(
     brush_materials_dir.mkdir(parents=True, exist_ok=True)
     materialsrc.mkdir(parents=True, exist_ok=True)
 
-    texture_outputs = extract_textures(neo, destination.parent / "textures")
+    texture_outputs = extract_textures(neo, destination.parent / "textures", override)
     extracted = {item["index"]: Path(item["output"]) for item in texture_outputs if "output" in item}
     special_markers = ("alpha", "trans", "sky", "water", "billboard", "_bb", "scroll", "anim")
     manifest: list[dict] = []
@@ -995,13 +1003,26 @@ def export_hammer(
             (bounds_min[1] + bounds_max[1]) * 0.5,
             bounds_min[2] + 64.0,
         )
-        entities.append(
-            f'entity\n{{\n"id" "{next_entity_id}"\n"classname" "info_player_start"\n'
-            f'"origin" "{spawn[0]:.9g} {spawn[1]:.9g} {spawn[2]:.9g}"\n'
-            '"angles" "0 0 0"\n}\n'
-        )
+        if target_game == "css":
+            # Keep the two team spawns close to the model-map origin while
+            # leaving enough room that the player hulls do not overlap.
+            for entity_id, classname, x_offset in (
+                (next_entity_id, "info_player_terrorist", -32.0),
+                (next_entity_id + 1, "info_player_counterterrorist", 32.0),
+            ):
+                entities.append(
+                    f'entity\n{{\n"id" "{entity_id}"\n"classname" "{classname}"\n'
+                    f'"origin" "{spawn[0] + x_offset:.9g} {spawn[1]:.9g} {spawn[2]:.9g}"\n'
+                    '"angles" "0 0 0"\n}\n'
+                )
+        else:
+            entities.append(
+                f'entity\n{{\n"id" "{next_entity_id}"\n"classname" "info_player_start"\n'
+                f'"origin" "{spawn[0]:.9g} {spawn[1]:.9g} {spawn[2]:.9g}"\n'
+                '"angles" "0 0 0"\n}\n'
+            )
 
-    vmf = destination / f"{map_name}.vmf"
+    vmf = destination / f"{vmf_name or map_name}.vmf"
     vmf.write_text(
         'versioninfo\n{\n"editorversion" "400"\n"editorbuild" "0"\n'
         '"mapversion" "1"\n"formatversion" "100"\n"prefab" "0"\n}\n'
@@ -1797,6 +1818,7 @@ def export_decompiled_vmf(
         "trigger_teleport": "TOOLS/TOOLSTRIGGER",
         "PLACE_NAME": "TOOLS/TOOLSTRIGGER",
         "game_zone_player": "TOOLS/TOOLSTRIGGER",
+        "func_buyzone": "TOOLS/TOOLSTRIGGER",
         "func_bomb_target": "TOOLS/TOOLSTRIGGER",
         "func_water_analog": "TOOLS/TOOLSNODRAW",
     }
@@ -1872,7 +1894,12 @@ def export_decompiled_vmf(
             elif key == "angles":
                 value = _source_angles(value)
             # Common GoldSrc-to-Source key translations.
-            if key == "spawnflags":
+            if target_game == "css" and source_class == "func_buyzone" and key.lower() == "team":
+                # GoldSrc CS uses 1=T and 2=CT. CS:S's TeamNum base uses
+                # 2=Terrorist and 3=Counter-Terrorist.
+                target_key = "TeamNum"
+                value = {"1": "2", "2": "3"}.get(value.strip(), value)
+            elif key == "spawnflags":
                 target_key = "_neo_spawnflags_original"
             elif key == "master":
                 target_key = "_neo_master_manual"
@@ -1947,6 +1974,68 @@ def export_decompiled_vmf(
         parts.append('}\n')
         entity_texts.append("".join(parts))
         entity_id += max(1, entity_brushes + 1)
+
+    generated_buyzones = 0
+    source_buyzones = sum(
+        entity["keyvalues"].get("classname") == "func_buyzone"
+        for entity in map_entities[1:]
+    )
+    if target_game == "css" and source_buyzones == 0:
+        spawn_groups = (
+            ("info_player_deathmatch", 2),  # Terrorist
+            ("info_player_start", 3),       # Counter-Terrorist
+        )
+        for spawn_class, team_num in spawn_groups:
+            spawn_points: list[tuple[float, float, float]] = []
+            for source_entity in map_entities[1:]:
+                values = source_entity["keyvalues"]
+                if values.get("classname") != spawn_class or "origin" not in values:
+                    continue
+                try:
+                    raw_point = tuple(map(float, values["origin"].split()))
+                    if len(raw_point) == 3:
+                        spawn_points.append(_source_point(raw_point, center, scale))
+                except ValueError:
+                    continue
+            if not spawn_points:
+                continue
+            parts = [
+                f'entity\n{{\n"id" "{entity_id}"\n"classname" "func_buyzone"\n'
+                f'"TeamNum" "{team_num}"\n'
+            ]
+            for point in spawn_points:
+                x0, x1 = point[0] - 128, point[0] + 128
+                y0, y1 = point[1] - 128, point[1] + 128
+                z0, z1 = point[2] - 32, point[2] + 96
+                planes = (
+                    ((x1, y1, z1), (x1, y1, z0), (x1, y0, z1)),
+                    ((x0, y0, z1), (x0, y0, z0), (x0, y1, z1)),
+                    ((x0, y1, z1), (x0, y1, z0), (x1, y1, z1)),
+                    ((x1, y0, z1), (x1, y0, z0), (x0, y0, z1)),
+                    ((x0, y0, z1), (x0, y1, z1), (x1, y0, z1)),
+                    ((x0, y1, z0), (x0, y0, z0), (x1, y1, z0)),
+                )
+                sides: list[str] = []
+                for plane in planes:
+                    plane_text = " ".join(
+                        "(" + " ".join(f"{value:.9g}" for value in vertex) + ")"
+                        for vertex in plane
+                    )
+                    sides.append(
+                        f'side\n{{\n"id" "{entity_side_id}"\n"plane" "{plane_text}"\n'
+                        '"material" "TOOLS/TOOLSTRIGGER"\n'
+                        '"uaxis" "[1 0 0 0] 0.25"\n"vaxis" "[0 -1 0 0] 0.25"\n'
+                        '"rotation" "0"\n"lightmapscale" "16"\n"smoothing_groups" "0"\n}\n'
+                    )
+                    entity_side_id += 1
+                parts.append(
+                    f'solid\n{{\n"id" "{entity_id + len(parts)}"\n' + "".join(sides) + '}\n'
+                )
+            parts.append('}\n')
+            entity_texts.append("".join(parts))
+            entity_id += len(spawn_points) + 1
+            converted_classes["func_buyzone"] = converted_classes.get("func_buyzone", 0) + 1
+            generated_buyzones += 1
 
     light_review_rows: list[dict] = []
     transferred_lights = 0
@@ -2035,6 +2124,7 @@ def export_decompiled_vmf(
             "unsupported_entity_classes": unsupported_classes,
             "entity_review": str(entity_review_path), "target_game": target_game,
             "transferred_lights": transferred_lights,
+            "generated_buyzones": generated_buyzones,
             "light_review": str(light_review_path) if transfer_lights else None}
 
 
@@ -2053,6 +2143,97 @@ def find_game_directory(source_bin: Path, override: Path | None) -> Path:
     raise NeoFormatError(
         f"could not infer the game directory below {root}; pass --game-dir explicitly"
     )
+
+
+def export_css_overview(
+    neo: NeoFile, overview_path: Path, hammer_dir: Path, scale: float,
+    map_name: str | None = None,
+    radar_rotation: str = "none",
+) -> dict:
+    """Convert a GoldSrc overview definition into staged CS:S overview assets."""
+    text = overview_path.read_text(encoding="latin-1")
+
+    def scalar(name: str) -> float:
+        match = re.search(rf"\b{name}\s+([-+]?\d+(?:\.\d+)?)", text, re.IGNORECASE)
+        if not match:
+            raise NeoFormatError(f"{overview_path}: missing {name} overview value")
+        return float(match.group(1))
+
+    origin_match = re.search(
+        r"\bORIGIN\s+([-+]?\d+(?:\.\d+)?)\s+([-+]?\d+(?:\.\d+)?)\s+([-+]?\d+(?:\.\d+)?)",
+        text, re.IGNORECASE,
+    )
+    image_match = re.search(r'\bIMAGE\s+"([^"]+)"', text, re.IGNORECASE)
+    if not origin_match or not image_match:
+        raise NeoFormatError(f"{overview_path}: missing ORIGIN or IMAGE overview value")
+    zoom = scalar("ZOOM")
+    if zoom <= 0:
+        raise NeoFormatError(f"{overview_path}: ZOOM must be greater than zero")
+    original_origin = tuple(float(value) for value in origin_match.groups())
+    original_rotated = int(scalar("ROTATED")) != 0
+    image_reference = image_match.group(1).replace("\\", "/")
+    image_name = Path(image_reference).name
+    candidates = [overview_path.parent / image_name]
+    if overview_path.parent.name.lower() != "overviews":
+        candidates.append(overview_path.parent.parent / "overviews" / image_name)
+    image_path = next((candidate for candidate in candidates if candidate.is_file()), None)
+    if image_path is None:
+        raise NeoFormatError(
+            f"{overview_path}: referenced overview image was not found: {image_reference}"
+        )
+
+    vertices = neo.vertices()
+    logical = neo.lumps[1].count or len(vertices)
+    positions = vertices[:min(logical, len(vertices))]
+    center = tuple(
+        (min(point[axis] for point in positions) + max(point[axis] for point in positions)) * 0.5
+        for axis in range(3)
+    )
+    source_center = _source_point(original_origin, center, scale)
+    # Convert GoldSrc's overview zoom to Source world units per radar pixel.
+    # The captured 1024-wide overview uses an 8192-unit horizontal span.
+    source_scale = 8.0 * scale / zoom
+    pos_x = source_center[0] - 512.0 * source_scale
+    pos_y = source_center[1] + 512.0 * source_scale
+    # Decompiled brush conversion rotates the original XY plane by +90 degrees.
+    # Toggle GoldSrc's rotation flag to retain the captured image orientation.
+    source_rotated = not original_rotated
+    map_name = map_name or neo.path.stem
+
+    materialsrc = hammer_dir / "materialsrc" / "overviews"
+    materials = hammer_dir / "materials" / "overviews"
+    resources = hammer_dir / "resource" / "overviews"
+    for directory in (materialsrc, materials, resources):
+        directory.mkdir(parents=True, exist_ok=True)
+    staged_image = materialsrc / f"{map_name}{image_path.suffix.lower()}"
+    shutil.copyfile(image_path, staged_image)
+    (materials / f"{map_name}.vmt").write_text(
+        '"UnlitGeneric"\n{\n'
+        f'    "$basetexture" "overviews/{map_name}"\n'
+        '    "$translucent" "1"\n    "$vertexalpha" "1"\n'
+        '    "$vertexcolor" "1"\n    "$ignorez" "1"\n}\n',
+        encoding="utf-8",
+    )
+    definition = resources / f"{map_name}.txt"
+    definition.write_text(
+        f'"{map_name}"\n{{\n'
+        f'    "material" "overviews/{map_name}"\n'
+        f'    "pos_x" "{pos_x:.9g}"\n'
+        f'    "pos_y" "{pos_y:.9g}"\n'
+        f'    "scale" "{source_scale:.9g}"\n'
+        f'    "rotate" "{int(source_rotated)}"\n'
+        '    "zoom" "1.0"\n}\n',
+        encoding="utf-8",
+    )
+    return {
+        "input": str(overview_path), "image": str(image_path),
+        "staged_image": str(staged_image), "definition": str(definition),
+        "material": str(materials / f"{map_name}.vmt"),
+        "goldsrc_zoom": zoom, "goldsrc_origin": list(original_origin),
+        "goldsrc_rotated": original_rotated, "pos_x": pos_x, "pos_y": pos_y,
+        "scale": source_scale, "rotate": source_rotated,
+        "image_rotation": radar_rotation,
+    }
 
 
 def run_source_tool(command: list[str], cwd: Path, timeout: float) -> dict:
@@ -2093,6 +2274,9 @@ def compile_hammer_output(
     verbose: bool,
     max_vtf_size: int,
     compile_models: bool = True,
+    override_textures: bool = False,
+    override_models: bool = False,
+    radar_rotation: str = "none",
 ) -> dict:
     def log(message: str) -> None:
         if verbose:
@@ -2122,6 +2306,14 @@ def compile_hammer_output(
         target = game_materials / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(vmt, target)
+    resource_root = hammer_dir / "resource"
+    if resource_root.is_dir():
+        for resource in resource_root.rglob("*"):
+            if not resource.is_file():
+                continue
+            target = game_dir / "resource" / resource.relative_to(resource_root)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(resource, target)
 
     ffmpeg = None
     if ffmpeg_override is not None:
@@ -2146,9 +2338,17 @@ def compile_hammer_output(
         if image.is_file() and image.stem in active_materials
     )
     for image_number, image in enumerate(images, 1):
+        relative = image.relative_to(source_root)
+        compiled_vtf = game_materials / relative.with_suffix(".vtf")
+        if compiled_vtf.is_file() and not override_textures:
+            log(f"Texture {image_number}/{len(images)}: cached {compiled_vtf.name}")
+            texture_jobs.append({
+                "source": str(image), "output": str(compiled_vtf),
+                "exit_code": 0, "skipped_existing": True,
+            })
+            continue
         log(f"Texture {image_number}/{len(images)}: {image.name}")
         started = time.monotonic()
-        relative = image.relative_to(source_root)
         staged = staged_materialsrc / relative.with_suffix(".tga")
         staged.parent.mkdir(parents=True, exist_ok=True)
         width = height = 0
@@ -2157,6 +2357,9 @@ def compile_hammer_output(
             height, width = struct.unpack_from("<II", header, 12)
         elif image.suffix.lower() == ".tga" and len(header) >= 18:
             width, height = struct.unpack_from("<HH", header, 12)
+        elif image.suffix.lower() == ".bmp" and len(header) >= 26 and header[:2] == b"BM":
+            width, height = struct.unpack_from("<ii", header, 18)
+            width, height = abs(width), abs(height)
         scale_filter = None
         if width and height:
             # Source 1's vtex requires power-of-two dimensions and can crash
@@ -2167,7 +2370,32 @@ def compile_hammer_output(
             target_height = 1 << (min(height, size_limit).bit_length() - 1)
         else:
             target_width, target_height = width, height
-        if target_width != width or target_height != height:
+        overview_image = relative.parts and relative.parts[0].lower() == "overviews"
+        if overview_image and width and height and (width != height or radar_rotation != "none"):
+            square = max(width, height)
+            target_square = 1 << (min(square, max(1, max_vtf_size)).bit_length() - 1)
+            overview_filters = []
+            if radar_rotation == "cw":
+                overview_filters.append("transpose=1")
+            elif radar_rotation == "ccw":
+                overview_filters.append("transpose=2")
+            elif radar_rotation == "180":
+                overview_filters.extend(("hflip", "vflip"))
+            if width != height:
+                overview_filters.append(
+                    f"pad={square}:{square}:(ow-iw)/2:(oh-ih)/2:black"
+                )
+            overview_filters.append(f"scale={target_square}:{target_square}")
+            scale_filter = ",".join(overview_filters)
+            target_width = target_height = target_square
+            rotation_message = (
+                f", rotating {radar_rotation}" if radar_rotation != "none" else ""
+            )
+            log(
+                f"  padding {width}x{height} to {square}x{square}"
+                f"{rotation_message}, resizing to {target_square}x{target_square}"
+            )
+        elif target_width != width or target_height != height:
             scale_filter = f"scale={target_width}:{target_height}"
             log(f"  resizing {width}x{height} to {target_width}x{target_height}")
 
@@ -2187,7 +2415,7 @@ def compile_hammer_output(
         else:
             texture_jobs.append({
                 "source": str(image), "exit_code": -1,
-                "error": "DDS conversion requires ffmpeg; pass --ffmpeg or add it to PATH",
+                "error": "image conversion requires ffmpeg; pass --ffmpeg or add it to PATH",
             })
             continue
         if conversion["exit_code"] != 0:
@@ -2209,6 +2437,22 @@ def compile_hammer_output(
         log("Skipping model compilation for textured-brush workflow")
     for qc_number, qc in enumerate(qcs, 1):
         qc = qc.resolve()
+        qc_text = qc.read_text(encoding="utf-8", errors="replace")
+        model_match = re.search(
+            r'^\s*\$modelname\s+"([^"]+)"', qc_text,
+            re.IGNORECASE | re.MULTILINE,
+        )
+        compiled_model = (
+            game_models / Path(model_match.group(1).replace("\\", "/"))
+            if model_match else None
+        )
+        if compiled_model is not None and compiled_model.is_file() and not override_models:
+            log(f"Model {qc_number}/{len(qcs)}: cached {compiled_model.name}")
+            model_jobs.append({
+                "qc": str(qc), "output": str(compiled_model),
+                "exit_code": 0, "skipped_existing": True,
+            })
+            continue
         log(f"Model {qc_number}/{len(qcs)}: {qc.name}")
         started = time.monotonic()
         result = run_source_tool(
@@ -2261,7 +2505,7 @@ def write_tga(path: Path, width: int, height: int, pixel_size: int, pixels: byte
     path.write_bytes(header + payload)
 
 
-def extract_textures(neo: NeoFile, destination: Path) -> list[dict]:
+def extract_textures(neo: NeoFile, destination: Path, override: bool = False) -> list[dict]:
     blob = neo.lump_data(2)
     if len(blob) < 4:
         return []
@@ -2302,7 +2546,10 @@ def extract_textures(neo: NeoFile, destination: Path) -> list[dict]:
             source = neo.path.parent.parent / "tex" / Path(reference)
             if source.is_file():
                 output = destination / f"{index:04d}_{name}{source.suffix.lower()}"
-                shutil.copyfile(source, output)
+                if output.is_file() and not override:
+                    result["skipped_existing"] = True
+                else:
+                    shutil.copyfile(source, output)
                 result["external_reference"] = reference
                 result["output"] = str(output)
                 results.append(result)
@@ -2318,7 +2565,10 @@ def extract_textures(neo: NeoFile, destination: Path) -> list[dict]:
             continue
 
         output = destination / f"{index:04d}_{name}.tga"
-        write_tga(output, width, height, pixel_size, bytes(blob[pixel_start : pixel_start + required]))
+        if output.is_file() and not override:
+            result["skipped_existing"] = True
+        else:
+            write_tga(output, width, height, pixel_size, bytes(blob[pixel_start : pixel_start + required]))
         result["output"] = str(output)
         results.append(result)
     return results
@@ -2333,6 +2583,8 @@ def command_inspect(args: argparse.Namespace) -> int:
 
 def command_export(args: argparse.Namespace) -> int:
     neo = NeoFile.read(args.input)
+    override_textures = args.override in ("textures", "all")
+    override_models = args.override in ("models", "all")
     decompiled_input = args.decompiled_vmf or args.decompiled_map
     if args.hammer and (args.blender_axes or args.source_axes):
         raise NeoFormatError("--hammer uses native Source coordinates and cannot be combined with an axis option")
@@ -2346,6 +2598,14 @@ def command_export(args: argparse.Namespace) -> int:
         raise NeoFormatError(f"decompiled map file was not found: {decompiled_input}")
     if args.location_bsp and not args.location_bsp.is_file():
         raise NeoFormatError(f"location BSP file was not found: {args.location_bsp}")
+    if args.overview and not args.hammer:
+        raise NeoFormatError("--overview requires --hammer")
+    if args.overview and not args.overview.is_file():
+        raise NeoFormatError(f"overview definition was not found: {args.overview}")
+    if args.radar_rotate != "none" and not args.overview:
+        raise NeoFormatError("--radar-rotate requires --overview")
+    if args.radar_rotate != "none" and not args.source_bin:
+        raise NeoFormatError("--radar-rotate requires --source-bin to compile the rotated image")
     if (args.game_dir or args.ffmpeg) and not args.source_bin:
         raise NeoFormatError("--game-dir and --ffmpeg require --source-bin")
     if args.tool_timeout <= 0:
@@ -2362,27 +2622,41 @@ def command_export(args: argparse.Namespace) -> int:
         args.blender_axes,
         args.flip_v,
         args.split_objects,
+        override_textures,
     )
     if not args.no_textures:
-        report["textures"] = extract_textures(neo, args.output / "textures")
+        report["textures"] = extract_textures(
+            neo, args.output / "textures", override_textures,
+        )
     if args.hammer:
         report["hammer"] = export_hammer(
             neo, args.output / "hammer", args.scale, args.flip_v,
             export_all_textures=bool(decompiled_input),
+            vmf_name=f"{args.input.stem}_models" if decompiled_input else None,
+            override=override_textures,
+            target_game=args.target_game,
         )
         if decompiled_input:
             report["textured_brushes"] = export_decompiled_vmf(
                 neo, decompiled_input,
-                args.output / "hammer" / f"{args.input.stem}_brushes.vmf",
+                args.output / "hammer" / f"{args.input.stem}.vmf",
                 args.scale,
                 args.max_vtf_size,
                 args.target_game,
                 args.transfer_lights,
             )
+        if args.overview:
+            report["overview"] = export_css_overview(
+                neo, args.overview, args.output / "hammer", args.scale,
+                args.input.stem, args.radar_rotate,
+            )
         if args.source_bin:
             report["hammer_compile"] = compile_hammer_output(
                 args.output / "hammer", args.source_bin, args.game_dir, args.ffmpeg,
                 args.tool_timeout, args.verbose, args.max_vtf_size,
+                override_textures=override_textures,
+                override_models=override_models,
+                radar_rotation=args.radar_rotate,
             )
     if args.location_bsp:
         location_dir = args.output / "hammer" if args.hammer else args.output
@@ -2439,6 +2713,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     export_parser.add_argument("--no-textures", action="store_true")
     export_parser.add_argument(
+        "--override",
+        nargs="?",
+        const="all",
+        choices=("models", "textures", "all"),
+        help=(
+            "override cached models, textures/VTFs, or all assets; "
+            "using --override without a value means all"
+        ),
+    )
+    export_parser.add_argument(
         "--hammer",
         action="store_true",
         help="also generate Source SMD/QC/VMT files and a prop_static VMF scaffold",
@@ -2472,6 +2756,18 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         metavar="PATH",
         help="recover CP932 PLACE_NAME labels and location IDs from the original GoldSrc BSP into JSON",
+    )
+    export_parser.add_argument(
+        "--overview",
+        type=Path,
+        metavar="PATH",
+        help="convert a GoldSrc overview TXT/BMP into staged Counter-Strike: Source radar assets",
+    )
+    export_parser.add_argument(
+        "--radar-rotate",
+        choices=("none", "cw", "ccw", "180"),
+        default="none",
+        help="optionally rotate only the compiled radar image (default: none)",
     )
     export_parser.add_argument(
         "--source-bin",
