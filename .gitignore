@@ -224,3 +224,4 @@ converted*
 *.txt
 linux
 decompiled
+!preview.jpg
